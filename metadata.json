@@ -1,0 +1,6 @@
+{
+  "name": "Aura Stream",
+  "description": "Plataforma de streaming em Dark Mode com curadoria multiplataforma, trailers interativos, carrosséis de catálogo e player simulado.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
