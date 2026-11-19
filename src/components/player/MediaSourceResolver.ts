@@ -1,4 +1,4 @@
-import { SourceValidationState } from '../../types/streaming';
+import { AuthorizedStreamHeaders, SourceValidationState } from '../../types/streaming';
 import { DetectedMediaType, unwrapTargetUrl } from './MediaTypeDetector';
 
 export interface PlaybackAttempt {
@@ -161,10 +161,42 @@ export async function resolveVodSource(
   }
 }
 
-export function applyStreamProxyUrl(rawUrl: string, proxyPrefix = ''): string {
+export function hasAuthorizedOriginHeaders(
+  headers?: AuthorizedStreamHeaders
+): boolean {
+  if (!headers) return false;
+  return Boolean(
+    headers.referer?.trim() ||
+      headers.userAgent?.trim() ||
+      headers.origin?.trim()
+  );
+}
+
+export function appendAuthorizedHeadersToProxyUrl(
+  proxyUrl: string,
+  headers?: AuthorizedStreamHeaders
+): string {
+  if (!headers || !proxyUrl.startsWith('/api/stream')) return proxyUrl;
+  const params = new URLSearchParams();
+  if (headers.referer?.trim()) params.set('referer', headers.referer.trim());
+  if (headers.userAgent?.trim()) params.set('ua', headers.userAgent.trim());
+  if (headers.origin?.trim()) params.set('origin', headers.origin.trim());
+  const extra = params.toString();
+  if (!extra) return proxyUrl;
+  return proxyUrl.includes('?') ? `${proxyUrl}&${extra}` : `${proxyUrl}?${extra}`;
+}
+
+export function applyStreamProxyUrl(
+  rawUrl: string,
+  proxyPrefix = '',
+  headers?: AuthorizedStreamHeaders
+): string {
   const prefix = proxyPrefix.trim();
   if (!prefix) {
-    return `/api/stream?url=${encodeURIComponent(rawUrl)}`;
+    return appendAuthorizedHeadersToProxyUrl(
+      `/api/stream?url=${encodeURIComponent(rawUrl)}`,
+      headers
+    );
   }
   if (prefix.includes('{url}')) {
     return prefix.replace('{url}', encodeURIComponent(rawUrl));
@@ -184,11 +216,18 @@ export function buildPlaybackAttempts(
   streamProxyPrefix: string,
   autoProxyHttpStreams: boolean,
   forceProxy: boolean,
-  resolvedUrl?: string
+  resolvedUrl?: string,
+  sourceHeaders?: AuthorizedStreamHeaders
 ): PlaybackAttempt[] {
   if (!rawUrl) return [];
   if (rawUrl.startsWith('/api/stream')) {
-    return [{ mode: 'proxy', url: rawUrl, label: 'Proxy Interno (/api/stream)' }];
+    return [
+      {
+        mode: 'proxy',
+        url: appendAuthorizedHeadersToProxyUrl(rawUrl, sourceHeaders),
+        label: 'Proxy Interno (/api/stream)',
+      },
+    ];
   }
 
   const effectiveResolved =
@@ -208,8 +247,12 @@ export function buildPlaybackAttempts(
   };
 
   const pushProxyAttempts = (target: string, prefixLabel: string) => {
-    const configuredProxyUrl = applyStreamProxyUrl(target, streamProxyPrefix);
-    const internalProxyUrl = applyStreamProxyUrl(target, '');
+    const configuredProxyUrl = applyStreamProxyUrl(
+      target,
+      streamProxyPrefix,
+      sourceHeaders
+    );
+    const internalProxyUrl = applyStreamProxyUrl(target, '', sourceHeaders);
     pushUnique({
       mode: 'proxy',
       url: configuredProxyUrl,
@@ -224,12 +267,24 @@ export function buildPlaybackAttempts(
     }
   };
 
-  if (forceProxy) {
+  const requiresCustomHeaders = hasAuthorizedOriginHeaders(sourceHeaders);
+
+  if (forceProxy || requiresCustomHeaders) {
     if (effectiveResolved) {
-      pushProxyAttempts(effectiveResolved, 'Proxy Configurado (URL Resolvida)');
+      pushProxyAttempts(
+        effectiveResolved,
+        requiresCustomHeaders
+          ? 'Proxy Autorizado com Cabeçalhos (URL Resolvida)'
+          : 'Proxy Configurado (URL Resolvida)'
+      );
     }
-    pushProxyAttempts(rawUrl, 'Proxy Configurado');
-    return list;
+    pushProxyAttempts(
+      rawUrl,
+      requiresCustomHeaders
+        ? 'Proxy Autorizado com Cabeçalhos'
+        : 'Proxy Configurado'
+    );
+    if (forceProxy) return list;
   }
 
   const primaryUrl = effectiveResolved || rawUrl;

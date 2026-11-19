@@ -32,6 +32,14 @@ export type SourceValidationState =
   | 'html_challenge'
   | 'offline';
 
+export type LiveLatencyProfile = 'realtime' | 'balanced' | 'stable';
+
+export interface AuthorizedStreamHeaders {
+  referer?: string;
+  userAgent?: string;
+  origin?: string;
+}
+
 export interface MediaSource {
   id: string;
   label: string;
@@ -42,6 +50,7 @@ export interface MediaSource {
   url: string;
   resolvedUrl?: string;
   detectedFormat?: string;
+  headers?: AuthorizedStreamHeaders;
   listId?: string;
   groupTitle?: string;
   tvgId?: string;

@@ -432,45 +432,123 @@ export function sniffStreamBytes(bytes: Uint8Array): {
   return { isHtml: false, isM3uList: false };
 }
 
+export interface ForwardedOriginHeaders {
+  referer?: string;
+  userAgent?: string;
+  origin?: string;
+}
+
+function isBlockedOriginUrlHost(hostname: string): boolean {
+  const clean = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (!clean || isBlockedHostname(clean)) return true;
+  if (net.isIP(clean) !== 0 && isBlockedIp(clean)) return true;
+  return false;
+}
+
+function sanitizeHeaderValue(raw: unknown, maxLen: number): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  if (/[\r\n\0]/.test(raw)) return undefined;
+  const cleaned = raw.trim();
+  if (!cleaned) return undefined;
+  return cleaned.slice(0, maxLen);
+}
+
+export function sanitizeAuthorizedOriginHeaders(input: {
+  referer?: unknown;
+  userAgent?: unknown;
+  origin?: unknown;
+}): ForwardedOriginHeaders {
+  const out: ForwardedOriginHeaders = {};
+  const rawRef = sanitizeHeaderValue(input.referer, 512);
+  if (rawRef) {
+    try {
+      const parsed = new URL(rawRef);
+      if (
+        (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
+        !isBlockedOriginUrlHost(parsed.hostname)
+      ) {
+        out.referer = parsed.toString();
+      }
+    } catch {
+      // Ignore invalid referer
+    }
+  }
+
+  const rawOrig = sanitizeHeaderValue(input.origin, 256);
+  if (rawOrig) {
+    try {
+      const parsed = new URL(rawOrig);
+      if (
+        (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
+        !isBlockedOriginUrlHost(parsed.hostname)
+      ) {
+        out.origin = parsed.origin;
+      }
+    } catch {
+      // Ignore invalid origin
+    }
+  }
+
+  const rawUa = sanitizeHeaderValue(input.userAgent, 300);
+  if (rawUa) {
+    out.userAgent = rawUa;
+  }
+
+  return out;
+}
+
+export function buildProxiedStreamUrlServer(
+  targetUrl: string,
+  headers?: ForwardedOriginHeaders
+): string {
+  let out = `/api/stream?url=${encodeURIComponent(targetUrl)}`;
+  if (headers?.referer) {
+    out += `&referer=${encodeURIComponent(headers.referer)}`;
+  }
+  if (headers?.userAgent) {
+    out += `&ua=${encodeURIComponent(headers.userAgent)}`;
+  }
+  if (headers?.origin) {
+    out += `&origin=${encodeURIComponent(headers.origin)}`;
+  }
+  return out;
+}
+
 export function rewriteHlsManifest(
   rawPlaylist: string,
-  baseUrl: string
+  baseUrl: string,
+  headers?: ForwardedOriginHeaders
 ): string {
+  const cleanHeaders = headers ? sanitizeAuthorizedOriginHeaders(headers) : undefined;
+  const rewriteUri = (rawUri: string): string | null => {
+    try {
+      const abs = new URL(rawUri, baseUrl);
+      if (
+        (abs.protocol === 'http:' || abs.protocol === 'https:') &&
+        !isBlockedHostname(abs.hostname)
+      ) {
+        authorizeHostname(abs.hostname);
+        return buildProxiedStreamUrlServer(abs.toString(), cleanHeaders);
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
   return rawPlaylist
     .split(/\r?\n/)
     .map((line) => {
       const trimmed = line.trim();
       if (!trimmed) return line;
       if (trimmed.startsWith('#')) {
-        return line.replace(/URI="([^"]+)"/gi, (_m, uri) => {
-          try {
-            const abs = new URL(uri, baseUrl);
-            if (
-              (abs.protocol === 'http:' || abs.protocol === 'https:') &&
-              !isBlockedHostname(abs.hostname)
-            ) {
-              authorizeHostname(abs.hostname);
-              return `URI="/api/stream?url=${encodeURIComponent(abs.toString())}"`;
-            }
-            return _m;
-          } catch {
-            return _m;
-          }
+        return line.replace(/URI=(["'])([^"']+)\1/gi, (_m, quote, uri) => {
+          const proxied = rewriteUri(uri);
+          return proxied ? `URI=${quote}${proxied}${quote}` : _m;
         });
       }
-      try {
-        const abs = new URL(trimmed, baseUrl);
-        if (
-          (abs.protocol === 'http:' || abs.protocol === 'https:') &&
-          !isBlockedHostname(abs.hostname)
-        ) {
-          authorizeHostname(abs.hostname);
-          return `/api/stream?url=${encodeURIComponent(abs.toString())}`;
-        }
-        return line;
-      } catch {
-        return line;
-      }
+      const proxied = rewriteUri(trimmed);
+      return proxied ?? line;
     })
     .join('\n');
 }
@@ -960,6 +1038,7 @@ export async function createServer(httpServer?: http.Server) {
       let mediaType = inferred.mediaType;
       let isHtml = isHtmlHeader;
       let isM3uList = false;
+      let isInvalidManifest = false;
 
       if (getResp.body) {
         try {
@@ -983,6 +1062,22 @@ export async function createServer(httpServer?: http.Server) {
             }
             if (sniffed.mediaType) {
               mediaType = sniffed.mediaType;
+            }
+            if (
+              inferred.mediaType === 'hls' &&
+              !sniffed.isHtml &&
+              !sniffed.isM3uList &&
+              !sniffed.engine
+            ) {
+              const sampleHead = Buffer.from(
+                firstRead.value.slice(0, Math.min(2048, firstRead.value.byteLength))
+              )
+                .toString('utf8')
+                .replace(/^\uFEFF/, '')
+                .trimStart();
+              if (sampleHead && !sampleHead.startsWith('#EXTM3U')) {
+                isInvalidManifest = true;
+              }
             }
           }
           await reader.cancel().catch(() => {});
@@ -1013,6 +1108,23 @@ export async function createServer(httpServer?: http.Server) {
           latencyMs,
           reason:
             'URL aponta para uma lista M3U de canais e não para um stream HLS/vídeo direto',
+        };
+      } else if (isInvalidManifest) {
+        payload = {
+          ok: false,
+          validationState: 'offline',
+          status: getResp.status,
+          originalUrl: targetUrl,
+          resolvedUrl: finalUrl,
+          finalUrlRedacted: redactUrlCredentialsServer(finalUrl),
+          redirectCount: redirects.length,
+          redirects,
+          contentType,
+          acceptRanges,
+          mediaType: 'hls',
+          detectedEngine: 'hls',
+          latencyMs,
+          reason: `Manifesto HLS inválido (HTTP ${getResp.status} sem #EXTM3U)`,
         };
       } else if (isHtml) {
         payload = {
@@ -1281,13 +1393,25 @@ export async function createServer(httpServer?: http.Server) {
       controller.abort();
     });
 
+    const forwardedHeaders = sanitizeAuthorizedOriginHeaders({
+      referer: req.query.referer,
+      userAgent: req.query.ua || req.query.userAgent,
+      origin: req.query.origin,
+    });
+
     try {
       const headers: Record<string, string> = {
-        'User-Agent': 'VLC/3.0.18 LibVLC/3.0.18',
+        'User-Agent': forwardedHeaders.userAgent || 'VLC/3.0.18 LibVLC/3.0.18',
         Accept: '*/*',
         'Accept-Encoding': 'identity',
         Connection: 'keep-alive',
       };
+      if (forwardedHeaders.referer) {
+        headers['Referer'] = forwardedHeaders.referer;
+      }
+      if (forwardedHeaders.origin) {
+        headers['Origin'] = forwardedHeaders.origin;
+      }
       if (req.headers.range) {
         headers['Range'] = String(req.headers.range);
       }
@@ -1380,6 +1504,14 @@ export async function createServer(httpServer?: http.Server) {
         }
       }
 
+      if (!firstChunk && isPlaylistMimeOrExt) {
+        res.setHeader('X-Aura-Error-Code', 'invalid_hls_manifest');
+        res
+          .status(422)
+          .send(`Manifesto HLS vazio recebido do servidor (HTTP ${upstream.status}).`);
+        return;
+      }
+
       if (firstChunk) {
         const sniffed = sniffStreamBytes(firstChunk);
         if (sniffed.isHtml) {
@@ -1394,61 +1526,81 @@ export async function createServer(httpServer?: http.Server) {
         }
 
         const headTextStart = Buffer.from(
-          firstChunk.slice(0, Math.min(64, firstChunk.byteLength))
+          firstChunk.slice(0, Math.min(2048, firstChunk.byteLength))
         )
           .toString('utf8')
           .replace(/^\uFEFF/, '')
           .trimStart();
 
-        if (headTextStart.startsWith('#EXTM3U') || isPlaylistMimeOrExt) {
-          if (headTextStart.startsWith('#EXTM3U')) {
-            // Buffer bounded manifest only (max 5 MB) so movies are never loaded into RAM
-            const MAX_MANIFEST_BYTES = 5 * 1024 * 1024;
-            const chunks: Uint8Array[] = [firstChunk];
-            let totalBytes = firstChunk.byteLength;
+        if (headTextStart.startsWith('#EXTM3U')) {
+          // Buffer bounded manifest only (max 5 MB) so movies are never loaded into RAM
+          const MAX_MANIFEST_BYTES = 5 * 1024 * 1024;
+          const chunks: Uint8Array[] = [firstChunk];
+          let totalBytes = firstChunk.byteLength;
 
-            while (totalBytes < MAX_MANIFEST_BYTES) {
-              const { value, done } = await reader.read();
-              if (done) break;
-              if (value && value.byteLength > 0) {
-                chunks.push(value);
-                totalBytes += value.byteLength;
-              }
+          while (totalBytes < MAX_MANIFEST_BYTES) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            if (value && value.byteLength > 0) {
+              chunks.push(value);
+              totalBytes += value.byteLength;
             }
+          }
 
-            if (totalBytes >= MAX_MANIFEST_BYTES) {
-              await reader.cancel().catch(() => {});
-              res.setHeader('X-Aura-Error-Code', 'manifest_too_large');
-              res.status(413).send('Manifesto excedeu limite seguro de 5 MB.');
-              return;
-            }
-
-            const fullText = Buffer.concat(
-              chunks.map((c) => Buffer.from(c))
-            ).toString('utf8');
-
-            const kind = classifyTextPlaylistKind(fullText);
-            if (kind === 'm3u_list') {
-              res.setHeader('X-Aura-Error-Code', 'm3u_playlist_not_hls');
-              res
-                .status(422)
-                .send(
-                  'A URL aponta para uma lista M3U de canais (#EXTINF:-1), e não para um manifesto HLS (.m3u8).'
-                );
-              return;
-            }
-
-            const rewritten = rewriteHlsManifest(fullText, finalUrl);
-            res.status(upstream.status);
-            res.setHeader(
-              'Content-Type',
-              lowerCt.includes('mpegurl')
-                ? contentType
-                : 'application/vnd.apple.mpegurl; charset=utf-8'
-            );
-            res.send(rewritten);
+          if (totalBytes >= MAX_MANIFEST_BYTES) {
+            await reader.cancel().catch(() => {});
+            res.setHeader('X-Aura-Error-Code', 'manifest_too_large');
+            res.status(413).send('Manifesto excedeu limite seguro de 5 MB.');
             return;
           }
+
+          const fullText = Buffer.concat(
+            chunks.map((c) => Buffer.from(c))
+          ).toString('utf8');
+
+          const kind = classifyTextPlaylistKind(fullText);
+          if (kind === 'm3u_list') {
+            res.setHeader('X-Aura-Error-Code', 'm3u_playlist_not_hls');
+            res
+              .status(422)
+              .send(
+                'A URL aponta para uma lista M3U de canais (#EXTINF:-1), e não para um manifesto HLS (.m3u8).'
+              );
+            return;
+          }
+          if (kind === 'unknown') {
+            res.setHeader('X-Aura-Error-Code', 'invalid_hls_manifest');
+            res
+              .status(422)
+              .send(
+                `Manifesto HLS inválido ou sem segmentos/diretivas válidas (HTTP ${upstream.status}).`
+              );
+            return;
+          }
+
+          const rewritten = rewriteHlsManifest(
+            fullText,
+            finalUrl,
+            forwardedHeaders
+          );
+          res.status(upstream.status);
+          res.setHeader(
+            'Content-Type',
+            lowerCt.includes('mpegurl')
+              ? contentType
+              : 'application/vnd.apple.mpegurl; charset=utf-8'
+          );
+          res.send(rewritten);
+          return;
+        } else if (isPlaylistMimeOrExt && !sniffed.engine) {
+          await reader.cancel().catch(() => {});
+          res.setHeader('X-Aura-Error-Code', 'invalid_hls_manifest');
+          res
+            .status(422)
+            .send(
+              `Manifesto HLS inválido (HTTP ${upstream.status} sem cabeçalho #EXTM3U).`
+            );
+          return;
         }
       }
 

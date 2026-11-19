@@ -205,3 +205,67 @@ export function isLikelyDynamicVodUrl(rawUrl: string): boolean {
   return !hasKnownMediaExt;
 }
 
+export function isHtmlResponseText(text: string): boolean {
+  const clean = text.replace(/^\uFEFF/, '').trimStart().toLowerCase();
+  if (!clean) return false;
+  return (
+    clean.startsWith('<!doctype') ||
+    clean.startsWith('<html') ||
+    clean.startsWith('<head') ||
+    clean.startsWith('<body') ||
+    clean.startsWith('<script') ||
+    (clean.startsWith('<') &&
+      (clean.includes('<html') ||
+        clean.includes('<head') ||
+        clean.includes('<title>') ||
+        clean.includes('<meta')))
+  );
+}
+
+/**
+ * Fixes relative child/segment URLs resolved by hls.js against a third-party
+ * proxy URL that carries the real upstream directory inside `?url=...`.
+ */
+export function fixNestedProxyPath(manifestUrl: string, requestUrl: string): string {
+  let manifest: URL;
+  let request: URL;
+  try {
+    manifest = new URL(manifestUrl);
+    request = new URL(requestUrl);
+  } catch {
+    return requestUrl;
+  }
+
+  // Keep internal /api/stream proxy URLs untouched (server rewrite handles them)
+  if (manifest.pathname === '/api/stream' || manifest.pathname === '/api/stream/proxy') {
+    return requestUrl;
+  }
+  if (request.pathname === manifest.pathname) return requestUrl;
+  if (manifest.protocol !== request.protocol || manifest.host !== request.host) {
+    return requestUrl;
+  }
+
+  const rawQuery = manifest.search.replace(/^\?/, '');
+  const nestedValue = rawQuery
+    .split('&')
+    .find((part) => part.startsWith('url='))
+    ?.slice('url='.length);
+  if (!nestedValue) return requestUrl;
+
+  let nestedPath: string;
+  try {
+    nestedPath = new URL(decodeURIComponent(nestedValue)).pathname;
+  } catch {
+    return requestUrl;
+  }
+
+  const manifestDir = manifest.pathname.slice(0, manifest.pathname.lastIndexOf('/') + 1);
+  const nestedDir = nestedPath.slice(0, nestedPath.lastIndexOf('/') + 1);
+  if (!manifestDir || !nestedDir || manifestDir === nestedDir) return requestUrl;
+  if (!request.pathname.startsWith(manifestDir)) return requestUrl;
+
+  const corrected = nestedDir + request.pathname.slice(manifestDir.length);
+  return `${request.protocol}//${request.host}${corrected}${request.search}${request.hash}`;
+}
+
+

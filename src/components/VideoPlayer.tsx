@@ -5,6 +5,7 @@ import {
   ArrowLeft,
   Check,
   Copy,
+  Gauge,
   Layers,
   Loader2,
   Maximize,
@@ -31,14 +32,22 @@ import {
 } from '../services/watchHistory';
 import {
   CatalogItem,
+  LiveLatencyProfile,
   MediaSource,
   SeriesEpisode,
   SourceValidationState,
 } from '../types/streaming';
 import {
+  HybridEngineKind,
   HybridPlayer,
   HybridPlayerValidationResult,
 } from './HybridPlayer';
+import { detectMediaTypeFromUrl } from './player/MediaTypeDetector';
+import {
+  LIVE_LATENCY_PROFILES,
+  getSavedLiveLatencyProfile,
+  saveLiveLatencyProfile,
+} from './player/liveHlsConfig';
 import { MediaImage } from './MediaImage';
 
 interface VideoPlayerProps {
@@ -201,6 +210,10 @@ export function VideoPlayer({
   const [volume, setVolume] = useState(90);
   const [isMuted, setIsMuted] = useState(false);
   const [showSourcesMenu, setShowSourcesMenu] = useState(false);
+  const [showLatencyMenu, setShowLatencyMenu] = useState(false);
+  const [liveLatencyProfile, setLiveLatencyProfile] =
+    useState<LiveLatencyProfile>(() => getSavedLiveLatencyProfile());
+  const [activeEngine, setActiveEngine] = useState<HybridEngineKind>('none');
   const [showDiagnostics, setShowDiagnostics] = useState(true);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [copiedUrl, setCopiedUrl] = useState(false);
@@ -226,6 +239,23 @@ export function VideoPlayer({
   const activeSource = availableSources[sourceIndex];
   const rawStreamUrl = activeSource?.url || '';
   const isLive = item?.type === 'live';
+  const isLiveHlsActive = Boolean(
+    isLive &&
+      rawStreamUrl &&
+      (activeEngine === 'hls.js' ||
+        activeEngine === 'native-hls' ||
+        (activeEngine === 'none' &&
+          detectMediaTypeFromUrl(rawStreamUrl, true) === 'hls'))
+  );
+
+  const handleLatencyProfileChange = useCallback(
+    (next: LiveLatencyProfile) => {
+      setLiveLatencyProfile(next);
+      saveLiveLatencyProfile(next);
+      setShowLatencyMenu(false);
+    },
+    []
+  );
 
   const currentEpisodeKey = item
     ? `${item.id}:${season || 1}:${episodeNumber || 1}:${episodeId || episodeLabel || ''}`
@@ -322,6 +352,8 @@ export function VideoPlayer({
     if (!item) return;
     setIsReady(false);
     setIsPlaying(true);
+    setActiveEngine('none');
+    setShowLatencyMenu(false);
     if (!rawStreamUrl) {
       setIsBuffering(false);
       setPlaybackError({
@@ -551,6 +583,10 @@ export function VideoPlayer({
             autoProxyHttpStreams={autoProxyHttpStreams}
             forceProxy={forceInternalProxy}
             enablePreflight={true}
+            sourceHeaders={activeSource?.headers}
+            liveLatencyProfile={liveLatencyProfile}
+            onLiveLatencyProfileChange={handleLatencyProfileChange}
+            onEngineChange={setActiveEngine}
             onVideoElement={handleVideoElement}
             onValidationResult={(res) => {
               void handleValidationResult(res);
@@ -907,11 +943,65 @@ export function VideoPlayer({
           </div>
 
           <div className="relative flex items-center gap-2">
+            {isLiveHlsActive && (
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowLatencyMenu((s) => !s);
+                    setShowSourcesMenu(false);
+                  }}
+                  aria-label="Latência da transmissão"
+                  title="Latência da transmissão (ao vivo HLS)"
+                  className="inline-flex h-10 items-center gap-2 rounded-lg border border-white/15 bg-black/60 px-3 text-xs font-semibold text-white hover:bg-white/15"
+                >
+                  <Gauge className="h-4 w-4 text-[#E50914]" />
+                  <span className="hidden sm:inline">
+                    {
+                      LIVE_LATENCY_PROFILES.find(
+                        (p) => p.id === liveLatencyProfile
+                      )?.label
+                    }
+                  </span>
+                </button>
+
+                {showLatencyMenu && (
+                  <div className="absolute right-0 bottom-12 w-72 rounded-lg border border-white/15 bg-[#121417] p-1.5 shadow-2xl">
+                    <p className="px-2.5 py-1.5 text-[11px] font-semibold text-white/45 uppercase">
+                      Latência da transmissão
+                    </p>
+                    {LIVE_LATENCY_PROFILES.map((profile) => (
+                      <button
+                        key={profile.id}
+                        type="button"
+                        onClick={() => handleLatencyProfileChange(profile.id)}
+                        className={`flex w-full flex-col rounded-md px-3 py-2 text-left transition-colors ${
+                          profile.id === liveLatencyProfile
+                            ? 'bg-[#E50914] text-white'
+                            : 'text-white/85 hover:bg-white/10'
+                        }`}
+                      >
+                        <span className="text-xs font-semibold">
+                          {profile.label}
+                        </span>
+                        <span className="text-[10px] opacity-80">
+                          {profile.shortDesc}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Fonte 1/X & Versões Selector */}
             <div className="relative">
               <button
                 type="button"
-                onClick={() => setShowSourcesMenu((s) => !s)}
+                onClick={() => {
+                  setShowSourcesMenu((s) => !s);
+                  setShowLatencyMenu(false);
+                }}
                 className="inline-flex h-10 items-center gap-2 rounded-lg border border-white/15 bg-black/60 px-3.5 text-xs font-semibold text-white hover:bg-white/15 tabular-nums"
               >
                 <Layers className="h-4 w-4 text-[#E50914]" />

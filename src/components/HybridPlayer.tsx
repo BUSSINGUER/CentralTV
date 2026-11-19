@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Hls from 'hls.js';
 import mpegts from 'mpegts.js';
-import { AlertTriangle, Loader2, Play } from 'lucide-react';
+import { AlertTriangle, Gauge, Loader2, Play } from 'lucide-react';
 import { redactUrlCredentials } from '../services/streamOrigins';
-import { SourceValidationState } from '../types/streaming';
+import {
+  AuthorizedStreamHeaders,
+  LiveLatencyProfile,
+  SourceValidationState,
+} from '../types/streaming';
 
 import {
   DetectedMediaType,
@@ -11,6 +15,8 @@ import {
   detectMediaTypeFromUrl,
   evaluateNativeCodecSupport,
   classifyM3uContent,
+  isHtmlResponseText,
+  fixNestedProxyPath,
   unwrapTargetUrl,
   getCleanPath,
   mapBackendFormatToMediaType,
@@ -20,8 +26,20 @@ import {
   PlaybackAttempt,
   applyStreamProxyUrl,
   buildPlaybackAttempts,
+  hasAuthorizedOriginHeaders,
   resolveVodSource,
 } from './player/MediaSourceResolver';
+import {
+  LIVE_FIRST_FRAME_TIMEOUT_MS,
+  LIVE_FROZEN_TIMEOUT_MS,
+  LIVE_WATCHDOG_INTERVAL_MS,
+  LIVE_LATENCY_PROFILES,
+  isFatalPlaylistHlsError,
+  getSavedLiveLatencyProfile,
+  saveLiveLatencyProfile,
+  buildLiveHlsConfig,
+  applyLiveLatencyProfileToHls,
+} from './player/liveHlsConfig';
 import {
   PlayerDiagnostics,
   DiagnosticHttpEntry,
@@ -74,6 +92,9 @@ export interface HybridPlayerProps {
   autoProxyHttpStreams?: boolean;
   forceProxy?: boolean;
   enablePreflight?: boolean;
+  sourceHeaders?: AuthorizedStreamHeaders;
+  liveLatencyProfile?: LiveLatencyProfile;
+  onLiveLatencyProfileChange?: (profile: LiveLatencyProfile) => void;
   onVideoElement?: (video: HTMLVideoElement | null) => void;
   onEngineChange?: (engine: HybridEngineKind) => void;
   onDiagnosticsChange?: (diag: PlayerDiagnostics) => void;
@@ -123,6 +144,9 @@ export function HybridPlayer({
   autoProxyHttpStreams = true,
   forceProxy = false,
   enablePreflight = true,
+  sourceHeaders,
+  liveLatencyProfile,
+  onLiveLatencyProfileChange,
   onVideoElement,
   onEngineChange,
   onDiagnosticsChange,
@@ -141,12 +165,42 @@ export function HybridPlayer({
     [url, isLive]
   );
 
+  const sourceHeadersKey = useMemo(
+    () =>
+      sourceHeaders
+        ? `${sourceHeaders.referer || ''}|${sourceHeaders.userAgent || ''}|${sourceHeaders.origin || ''}`
+        : '',
+    [sourceHeaders]
+  );
+
   const sessionKey = useMemo(
     () =>
       `${url}|${isLive ? 1 : 0}|${forceProxy ? 1 : 0}|${
         autoProxyHttpStreams ? 1 : 0
-      }|${streamProxyPrefix}`,
-    [url, isLive, forceProxy, autoProxyHttpStreams, streamProxyPrefix]
+      }|${streamProxyPrefix}|${sourceHeadersKey}`,
+    [url, isLive, forceProxy, autoProxyHttpStreams, streamProxyPrefix, sourceHeadersKey]
+  );
+
+  const [internalLatencyProfile, setInternalLatencyProfile] =
+    useState<LiveLatencyProfile>(() => getSavedLiveLatencyProfile());
+  const effectiveLatencyProfile = liveLatencyProfile ?? internalLatencyProfile;
+  const effectiveLatencyProfileRef = useRef<LiveLatencyProfile>(effectiveLatencyProfile);
+  effectiveLatencyProfileRef.current = effectiveLatencyProfile;
+
+  const [latencyMenuOpen, setLatencyMenuOpen] = useState(false);
+  const [latencyReinitTick, setLatencyReinitTick] = useState(0);
+
+  const handleSelectLatencyProfile = useCallback(
+    (next: LiveLatencyProfile) => {
+      saveLiveLatencyProfile(next);
+      if (onLiveLatencyProfileChange) {
+        onLiveLatencyProfileChange(next);
+      } else {
+        setInternalLatencyProfile(next);
+      }
+      setLatencyMenuOpen(false);
+    },
+    [onLiveLatencyProfileChange]
   );
 
   const [isBuffering, setIsBuffering] = useState(true);
@@ -170,6 +224,12 @@ export function HybridPlayer({
   const shakaRef = useRef<ShakaPlayerInstance | null>(null);
   const mpegtsRef = useRef<mpegts.Player | null>(null);
   const failTimeoutRef = useRef<number | null>(null);
+  const firstFrameNudgeRef = useRef<number | null>(null);
+  const liveWatchdogIntervalRef = useRef<number | null>(null);
+  const segmentTargetDurationRef = useRef<number | undefined>(undefined);
+  const resetLiveRecoveryRef = useRef<(() => void) | null>(null);
+  const lastLiveAdvancePerfRef = useRef<number>(performance.now());
+  const lastLiveVideoTimeRef = useRef<number>(0);
   const playStartPerfRef = useRef<number>(performance.now());
   const firstFrameRecordedRef = useRef(false);
   const validationEmittedRef = useRef(false);
@@ -231,6 +291,15 @@ export function HybridPlayer({
       window.clearTimeout(failTimeoutRef.current);
       failTimeoutRef.current = null;
     }
+    if (firstFrameNudgeRef.current) {
+      window.clearTimeout(firstFrameNudgeRef.current);
+      firstFrameNudgeRef.current = null;
+    }
+    if (liveWatchdogIntervalRef.current) {
+      window.clearInterval(liveWatchdogIntervalRef.current);
+      liveWatchdogIntervalRef.current = null;
+    }
+    resetLiveRecoveryRef.current = null;
 
     if (hlsRef.current) {
       const hls = hlsRef.current;
@@ -470,7 +539,8 @@ export function HybridPlayer({
             streamProxyPrefix,
             autoProxyHttpStreams,
             forceProxy,
-            activeResolved.resolvedUrl
+            activeResolved.resolvedUrl,
+            sourceHeaders
           )
         : [],
     [
@@ -480,6 +550,7 @@ export function HybridPlayer({
       streamProxyPrefix,
       autoProxyHttpStreams,
       forceProxy,
+      sourceHeaders,
     ]
   );
 
@@ -515,6 +586,9 @@ export function HybridPlayer({
     setErrorState(null);
     setAutoplayBlocked(false);
     firstFrameRecordedRef.current = false;
+    segmentTargetDurationRef.current = undefined;
+    lastLiveAdvancePerfRef.current = performance.now();
+    lastLiveVideoTimeRef.current = 0;
     playStartPerfRef.current = performance.now();
 
     const emitValidationOnce = (result: HybridPlayerValidationResult) => {
@@ -913,9 +987,23 @@ export function HybridPlayer({
       }, 0);
     };
 
+    const clearInitialTimeoutTimers = () => {
+      if (failTimeoutRef.current) {
+        window.clearTimeout(failTimeoutRef.current);
+        failTimeoutRef.current = null;
+      }
+      if (firstFrameNudgeRef.current) {
+        window.clearTimeout(firstFrameNudgeRef.current);
+        firstFrameNudgeRef.current = null;
+      }
+    };
+
     const markFirstFrameIfNeeded = () => {
       if (isStale() || firstFrameRecordedRef.current) return;
       firstFrameRecordedRef.current = true;
+      clearInitialTimeoutTimers();
+      lastLiveAdvancePerfRef.current = performance.now();
+      lastLiveVideoTimeRef.current = video.currentTime || 0;
       const elapsed = Math.max(
         1,
         Math.round(performance.now() - playStartPerfRef.current)
@@ -1000,9 +1088,9 @@ export function HybridPlayer({
       applyInitialResumeSeek();
       if (readyFired) return;
       readyFired = true;
-      if (failTimeoutRef.current) {
-        window.clearTimeout(failTimeoutRef.current);
-        failTimeoutRef.current = null;
+      // For live HLS, keep the 12s first-frame deadline active until frames actually render/advance
+      if (!(isLive && activeMediaType === 'hls')) {
+        clearInitialTimeoutTimers();
       }
 
       updateBuffering(false, '');
@@ -1090,15 +1178,100 @@ export function HybridPlayer({
     };
 
     const armLoadTimeout = () => {
-      if (failTimeoutRef.current) {
-        window.clearTimeout(failTimeoutRef.current);
+      clearInitialTimeoutTimers();
+      const isLiveHls = isLive && activeMediaType === 'hls';
+      const timeoutMs = isLiveHls
+        ? LIVE_FIRST_FRAME_TIMEOUT_MS
+        : isProxyTarget
+          ? 12000
+          : 8000;
+
+      if (isLiveHls) {
+        firstFrameNudgeRef.current = window.setTimeout(() => {
+          if (isStale() || firstFrameRecordedRef.current || !isPlayingRef.current) {
+            return;
+          }
+          if (hlsRef.current) {
+            try {
+              hlsRef.current.startLoad();
+            } catch {
+              // Ignore nudge error
+            }
+          }
+          if (video.paused) {
+            tryAutoPlayWithRecovery();
+          }
+        }, 6000);
       }
-      const timeoutMs = isProxyTarget ? 12000 : 8000;
+
       failTimeoutRef.current = window.setTimeout(() => {
+        if (isLiveHls && firstFrameRecordedRef.current) return;
         void failOrAdvanceAttempt(
-          'Tempo limite esgotado ao aguardar metadados/frames do stream.'
+          isLiveHls
+            ? 'Tempo limite esgotado (12s) sem exibição do primeiro frame da transmissão ao vivo.'
+            : 'Tempo limite esgotado ao aguardar metadados/frames do stream.'
         );
       }, timeoutMs);
+    };
+
+    const startLiveWatchdog = () => {
+      if (!isLive || activeMediaType !== 'hls') return;
+      if (liveWatchdogIntervalRef.current) {
+        window.clearInterval(liveWatchdogIntervalRef.current);
+      }
+      lastLiveAdvancePerfRef.current = performance.now();
+      lastLiveVideoTimeRef.current = video.currentTime || 0;
+      let lastNudgeAt = 0;
+
+      liveWatchdogIntervalRef.current = window.setInterval(() => {
+        if (isStale() || handledFailure) return;
+        const currTime = video.currentTime || 0;
+
+        if (currTime > lastLiveVideoTimeRef.current + 0.05) {
+          lastLiveVideoTimeRef.current = currTime;
+          lastLiveAdvancePerfRef.current = performance.now();
+          resetLiveRecoveryRef.current?.();
+          if (!firstFrameRecordedRef.current) {
+            markFirstFrameIfNeeded();
+          }
+          return;
+        }
+
+        if (!firstFrameRecordedRef.current || !isPlayingRef.current) {
+          return;
+        }
+
+        if (video.paused && readyFired) {
+          video.play().catch(() => {});
+        }
+
+        const now = performance.now();
+        const frozenMs = now - lastLiveAdvancePerfRef.current;
+
+        if (frozenMs >= LIVE_FROZEN_TIMEOUT_MS) {
+          void failOrAdvanceAttempt(
+            'Transmissão ao vivo congelada sem avanço há 25 segundos.'
+          );
+          return;
+        }
+
+        if (frozenMs >= 4000 && now - lastNudgeAt >= 6000) {
+          lastNudgeAt = now;
+          if (frozenMs >= 6000) {
+            updateBuffering(true, 'Reconectando transmissão ao vivo...');
+          }
+          if (hlsRef.current) {
+            try {
+              hlsRef.current.startLoad();
+            } catch {
+              // Ignore load recovery error
+            }
+          }
+          if (video.paused) {
+            video.play().catch(() => {});
+          }
+        }
+      }, LIVE_WATCHDOG_INTERVAL_MS);
     };
 
     const setEngine = (engine: HybridEngineKind) => {
@@ -1237,7 +1410,8 @@ export function HybridPlayer({
                     ? 'html_challenge'
                     : errCode === 'origin_not_allowed' || errCode === 'ssrf_blocked'
                       ? 'proxy_blocked'
-                      : errCode === 'm3u_playlist_not_hls'
+                      : errCode === 'm3u_playlist_not_hls' ||
+                          errCode === 'invalid_hls_manifest'
                         ? 'offline'
                         : undefined,
                 skipAdvance: errCode === 'm3u_playlist_not_hls',
@@ -1246,10 +1420,25 @@ export function HybridPlayer({
             return;
           }
           const manifestText = await headCheck.text();
-          if (classifyM3uContent(manifestText) === 'm3u_playlist') {
+          if (isHtmlResponseText(manifestText)) {
+            void failOrAdvanceAttempt(
+              'O manifesto HLS retornou HTML (HTTP 200) em vez de #EXTM3U.',
+              { httpStatus: 502, validationState: 'html_challenge' }
+            );
+            return;
+          }
+          const m3uKind = classifyM3uContent(manifestText);
+          if (m3uKind === 'm3u_playlist') {
             void failOrAdvanceAttempt(
               'O link aponta para uma lista M3U de canais e não para um manifesto HLS (.m3u8).',
               { skipAdvance: true, httpStatus: 422, validationState: 'offline' }
+            );
+            return;
+          }
+          if (m3uKind === 'unknown') {
+            void failOrAdvanceAttempt(
+              'Resposta HTTP 200 sem diretivas HLS (#EXTM3U) válidas.',
+              { httpStatus: 422, validationState: 'offline' }
             );
             return;
           }
@@ -1262,45 +1451,214 @@ export function HybridPlayer({
       setEngine('hls.js');
       updateBuffering(true, `Carregando HLS.js (${currentAttempt.label})...`);
       wireCommonVideoDiagnosticListeners();
+      startLiveWatchdog();
 
       const customPrefix = streamProxyPrefix.trim();
-      const needsCustomSegmentProxy = autoProxyHttpStreams && Boolean(customPrefix);
+      const requireHeaderProxy = hasAuthorizedOriginHeaders(sourceHeaders);
+
+      let lastManifestFailure: {
+        reason: string;
+        httpStatus?: number;
+        validationState?: SourceValidationState;
+        skipAdvance?: boolean;
+      } | null = null;
 
       const BaseLoader = Hls.DefaultConfig.loader;
-      class ProxySegmentLoader extends BaseLoader {
+      class LiveCapableHlsLoader extends BaseLoader {
         load(
           context: Parameters<InstanceType<typeof BaseLoader>['load']>[0],
           config: Parameters<InstanceType<typeof BaseLoader>['load']>[1],
           callbacks: Parameters<InstanceType<typeof BaseLoader>['load']>[2]
         ) {
-          if (
-            context.url &&
-            /^http:\/\//i.test(context.url) &&
-            !context.url.startsWith('/api/stream')
-          ) {
-            context.url = applyStreamProxyUrl(context.url, customPrefix);
+          if (context.url) {
+            context.url = fixNestedProxyPath(hlsUrl, context.url);
+            const isAlreadyInternal = context.url.startsWith('/api/stream');
+            const isInsecureHttp = /^http:\/\//i.test(context.url);
+            const shouldProxySubresource =
+              !isAlreadyInternal &&
+              ((autoProxyHttpStreams && isInsecureHttp) ||
+                (requireHeaderProxy && /^https?:\/\//i.test(context.url)));
+
+            if (shouldProxySubresource) {
+              context.url = applyStreamProxyUrl(
+                context.url,
+                customPrefix,
+                sourceHeaders
+              );
+            }
           }
-          super.load(context, config, callbacks);
+
+          const wrappedCallbacks: typeof callbacks = {
+            ...callbacks,
+            onSuccess: (response, stats, ctx, networkDetails) => {
+              const respStatus =
+                networkDetails instanceof XMLHttpRequest
+                  ? networkDetails.status || 200
+                  : networkDetails &&
+                      typeof networkDetails === 'object' &&
+                      'status' in networkDetails
+                    ? Number((networkDetails as { status?: number }).status) || 200
+                    : 200;
+
+              if (
+                (ctx.type === 'manifest' || ctx.type === 'level') &&
+                typeof response.data === 'string'
+              ) {
+                if (isHtmlResponseText(response.data)) {
+                  const errMsg = `Manifesto HLS retornou página HTML (HTTP ${respStatus}) em vez de stream.`;
+                  lastManifestFailure = {
+                    reason: errMsg,
+                    httpStatus: respStatus === 200 ? 502 : respStatus,
+                    validationState: 'html_challenge',
+                  };
+                  recordHttp({
+                    urlRedacted: redactUrlCredentials(ctx.url),
+                    status: respStatus,
+                    contentType: 'text/html',
+                    note: 'HTML disguised as HTTP 200 manifest',
+                  });
+                  callbacks.onError(
+                    { code: respStatus, text: errMsg },
+                    ctx,
+                    networkDetails,
+                    stats
+                  );
+                  return;
+                }
+
+                const kind = classifyM3uContent(response.data);
+                if (kind === 'm3u_playlist') {
+                  const errMsg =
+                    'O manifesto aponta para uma lista M3U de canais e não para uma playlist HLS (.m3u8).';
+                  lastManifestFailure = {
+                    reason: errMsg,
+                    httpStatus: 422,
+                    validationState: 'offline',
+                    skipAdvance: true,
+                  };
+                  callbacks.onError(
+                    { code: 422, text: errMsg },
+                    ctx,
+                    networkDetails,
+                    stats
+                  );
+                  return;
+                }
+
+                if (kind === 'unknown') {
+                  const errMsg = `Manifesto HLS retornou HTTP ${respStatus} sem diretivas #EXTM3U válidas.`;
+                  lastManifestFailure = {
+                    reason: errMsg,
+                    httpStatus: respStatus === 200 ? 422 : respStatus,
+                    validationState: 'offline',
+                  };
+                  recordHttp({
+                    urlRedacted: redactUrlCredentials(ctx.url),
+                    status: respStatus,
+                    note: 'Invalid non-HLS text response',
+                  });
+                  callbacks.onError(
+                    { code: respStatus === 200 ? 422 : respStatus, text: errMsg },
+                    ctx,
+                    networkDetails,
+                    stats
+                  );
+                  return;
+                }
+              }
+
+              callbacks.onSuccess(response, stats, ctx, networkDetails);
+            },
+            onError: (error, ctx, networkDetails, stats) => {
+              if (
+                networkDetails instanceof XMLHttpRequest &&
+                ctx.url.startsWith('/api/stream')
+              ) {
+                const errCode =
+                  networkDetails.getResponseHeader('x-aura-error-code') || '';
+                const upStatus = Number(
+                  networkDetails.getResponseHeader('x-aura-upstream-status') ||
+                    networkDetails.status ||
+                    error.code ||
+                    0
+                );
+                const upCt =
+                  networkDetails.getResponseHeader('x-aura-upstream-content-type') || '';
+
+                if (errCode === 'upstream_html') {
+                  lastManifestFailure = {
+                    reason: `Origem respondeu HTML (HTTP ${upStatus || 200}) em vez de manifesto HLS.`,
+                    httpStatus: networkDetails.status || 502,
+                    validationState: 'html_challenge',
+                  };
+                } else if (errCode === 'invalid_hls_manifest') {
+                  lastManifestFailure = {
+                    reason: `Manifesto HLS inválido na origem (HTTP ${upStatus || 422}).`,
+                    httpStatus: networkDetails.status || 422,
+                    validationState: 'offline',
+                  };
+                } else if (errCode === 'origin_not_allowed' || errCode === 'ssrf_blocked') {
+                  lastManifestFailure = {
+                    reason: `Proxy bloqueou a requisição (${errCode}).`,
+                    httpStatus: networkDetails.status || 403,
+                    validationState: 'proxy_blocked',
+                  };
+                }
+
+                if (upStatus || upCt || errCode) {
+                  recordHttp({
+                    urlRedacted: redactUrlCredentials(ctx.url),
+                    status: networkDetails.status || upStatus,
+                    contentType: upCt || undefined,
+                    note: errCode || (upStatus ? `upstream=${upStatus}` : undefined),
+                  });
+                }
+              }
+              callbacks.onError(error, ctx, networkDetails, stats);
+            },
+          };
+
+          super.load(context, config, wrappedCallbacks);
         }
       }
 
-      const hls = new Hls({
-        enableWorker: true,
-        lowLatencyMode: isLive,
-        manifestLoadingTimeOut: isProxyTarget ? 10000 : 6000,
-        ...(needsCustomSegmentProxy ? { loader: ProxySegmentLoader } : {}),
-      });
+      const hlsConfig = isLive
+        ? {
+            ...buildLiveHlsConfig(
+              effectiveLatencyProfileRef.current,
+              segmentTargetDurationRef.current,
+              { isProxyTarget }
+            ),
+            loader: LiveCapableHlsLoader,
+          }
+        : {
+            enableWorker: true,
+            lowLatencyMode: false,
+            manifestLoadingTimeOut: isProxyTarget ? 10000 : 6000,
+            loader: LiveCapableHlsLoader,
+          };
+
+      const hls = new Hls(hlsConfig);
       hlsRef.current = hls;
 
       let mediaRecoveryCount = 0;
       let networkRecoveryCount = 0;
+      const resetRecoveryCounters = () => {
+        mediaRecoveryCount = 0;
+        networkRecoveryCount = 0;
+      };
+      resetLiveRecoveryRef.current = resetRecoveryCounters;
 
       hls.on(Hls.Events.MANIFEST_LOADED, (_ev, data) => {
         if (isStale()) return;
         const respCode =
           data.networkDetails instanceof XMLHttpRequest
             ? data.networkDetails.status
-            : 200;
+            : data.networkDetails &&
+                typeof data.networkDetails === 'object' &&
+                'status' in data.networkDetails
+              ? Number((data.networkDetails as { status?: number }).status) || 200
+              : 200;
         recordHttp({
           urlRedacted: redactUrlCredentials(data.url || hlsUrl),
           status: respCode || 200,
@@ -1308,12 +1666,41 @@ export function HybridPlayer({
         });
       });
 
+      hls.on(Hls.Events.LEVEL_LOADED, (_ev, data) => {
+        if (isStale()) return;
+        resetRecoveryCounters();
+        const targetDuration = data.details?.targetduration;
+        if (
+          isLive &&
+          typeof targetDuration === 'number' &&
+          Number.isFinite(targetDuration) &&
+          targetDuration > 0 &&
+          targetDuration !== segmentTargetDurationRef.current
+        ) {
+          segmentTargetDurationRef.current = targetDuration;
+          applyLiveLatencyProfileToHls(
+            hls,
+            effectiveLatencyProfileRef.current,
+            targetDuration
+          );
+        }
+      });
+
       hls.on(Hls.Events.FRAG_LOADED, (_ev, data) => {
         if (isStale()) return;
+        resetRecoveryCounters();
+        const fragStatus =
+          data.networkDetails instanceof XMLHttpRequest
+            ? data.networkDetails.status
+            : data.networkDetails &&
+                typeof data.networkDetails === 'object' &&
+                'status' in data.networkDetails
+              ? Number((data.networkDetails as { status?: number }).status) || 200
+              : 200;
         if (!firstFrameRecordedRef.current) {
           recordHttp({
             urlRedacted: redactUrlCredentials(data.frag?.url || ''),
-            status: 200,
+            status: fragStatus || 200,
             note: `Seg #${data.frag?.sn ?? 0}`,
           });
         }
@@ -1354,6 +1741,35 @@ export function HybridPlayer({
 
         if (!data.fatal) return;
 
+        if (lastManifestFailure) {
+          const captured = lastManifestFailure;
+          lastManifestFailure = null;
+          void failOrAdvanceAttempt(captured.reason, {
+            httpStatus: captured.httpStatus ?? httpCode,
+            validationState: captured.validationState,
+            skipAdvance: captured.skipAdvance,
+          });
+          return;
+        }
+
+        // Fatal playlist/manifest parsing or loading errors must immediately advance/fail
+        if (isFatalPlaylistHlsError(String(data.details))) {
+          const isStatusZeroCorsCandidate =
+            data.type === Hls.ErrorTypes.NETWORK_ERROR && !httpCode;
+          const reason = httpCode
+            ? `Erro no manifesto HLS HTTP ${httpCode} (${data.details})`
+            : `Erro fatal no manifesto HLS (${data.details || 'Falha de carregamento'})`;
+          void failOrAdvanceAttempt(reason, {
+            httpStatus: httpCode,
+            isMixedOrCors: isStatusZeroCorsCandidate && !isProxyTarget,
+            validationState:
+              isStatusZeroCorsCandidate && !isProxyTarget
+                ? 'cors_blocked'
+                : undefined,
+          });
+          return;
+        }
+
         if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveryCount < 2) {
           mediaRecoveryCount += 1;
           if (mediaRecoveryCount === 2) {
@@ -1363,10 +1779,11 @@ export function HybridPlayer({
           return;
         }
 
+        const maxTransientNetworkRecoveries = isLive ? 3 : 1;
         if (
           data.type === Hls.ErrorTypes.NETWORK_ERROR &&
-          networkRecoveryCount < 1 &&
-          (!httpCode || httpCode >= 500)
+          networkRecoveryCount < maxTransientNetworkRecoveries &&
+          (!httpCode || httpCode >= 500 || httpCode === 408 || httpCode === 429)
         ) {
           networkRecoveryCount += 1;
           hls.startLoad();
@@ -1550,9 +1967,24 @@ export function HybridPlayer({
     isLive,
     streamProxyPrefix,
     autoProxyHttpStreams,
+    sourceHeaders,
+    latencyReinitTick,
     destroyPlayers,
     patchDiagnostics,
   ]);
+
+  // Apply live HLS latency profile changes in-place without interrupting playback
+  useEffect(() => {
+    if (!isLive || activeMediaType !== 'hls' || !hlsRef.current) return;
+    const needsReinit = applyLiveLatencyProfileToHls(
+      hlsRef.current,
+      effectiveLatencyProfile,
+      segmentTargetDurationRef.current
+    );
+    if (needsReinit) {
+      setLatencyReinitTick((t) => t + 1);
+    }
+  }, [effectiveLatencyProfile, isLive, activeMediaType]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -1592,6 +2024,24 @@ export function HybridPlayer({
         onTimeUpdate={() => {
           const video = videoRef.current;
           if (!video) return;
+          if (isLive && activeMediaType === 'hls') {
+            if (video.currentTime > lastLiveVideoTimeRef.current + 0.05) {
+              lastLiveVideoTimeRef.current = video.currentTime;
+              lastLiveAdvancePerfRef.current = performance.now();
+              resetLiveRecoveryRef.current?.();
+              if (!firstFrameRecordedRef.current) {
+                firstFrameRecordedRef.current = true;
+                if (failTimeoutRef.current) {
+                  window.clearTimeout(failTimeoutRef.current);
+                  failTimeoutRef.current = null;
+                }
+                if (firstFrameNudgeRef.current) {
+                  window.clearTimeout(firstFrameNudgeRef.current);
+                  firstFrameNudgeRef.current = null;
+                }
+              }
+            }
+          }
           const dur =
             video.duration && Number.isFinite(video.duration)
               ? Math.floor(video.duration)
@@ -1658,6 +2108,51 @@ export function HybridPlayer({
               {errorState.reason}
             </p>
           </div>
+        </div>
+      )}
+
+      {showOverlay && isLive && activeMediaType === 'hls' && !errorState && (
+        <div className="absolute top-3 right-3 z-20">
+          <button
+            type="button"
+            onClick={() => setLatencyMenuOpen((open) => !open)}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-white/15 bg-black/75 px-3 py-1.5 text-xs font-medium text-white backdrop-blur-md hover:bg-white/15"
+            aria-label="Latência da transmissão"
+          >
+            <Gauge className="h-3.5 w-3.5 text-[#E50914]" />
+            <span>
+              {
+                LIVE_LATENCY_PROFILES.find(
+                  (p) => p.id === effectiveLatencyProfile
+                )?.label
+              }
+            </span>
+          </button>
+
+          {latencyMenuOpen && (
+            <div className="absolute top-10 right-0 w-64 rounded-lg border border-white/15 bg-[#121417]/95 p-1.5 shadow-2xl backdrop-blur-xl">
+              <p className="px-2.5 py-1.5 text-[11px] font-semibold text-white/50 uppercase">
+                Latência da transmissão
+              </p>
+              {LIVE_LATENCY_PROFILES.map((profile) => (
+                <button
+                  key={profile.id}
+                  type="button"
+                  onClick={() => handleSelectLatencyProfile(profile.id)}
+                  className={`flex w-full flex-col rounded-md px-2.5 py-2 text-left transition-colors ${
+                    profile.id === effectiveLatencyProfile
+                      ? 'bg-[#E50914] text-white'
+                      : 'text-white/85 hover:bg-white/10'
+                  }`}
+                >
+                  <span className="text-xs font-semibold">{profile.label}</span>
+                  <span className="text-[10px] opacity-80">
+                    {profile.shortDesc}
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
