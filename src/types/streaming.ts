@@ -252,3 +252,40 @@ export interface M3uListRecord {
   mergedSourcesCount: number;
   ignoredDuplicatesCount: number;
 }
+
+export type ProcessingTaskScope = 'all_pending' | 'list';
+
+export type ProcessingTaskStatus =
+  | 'queued'
+  | 'running'
+  | 'paused'
+  | 'completed'
+  | 'cancelled'
+  | 'failed';
+
+export type ProcessingTaskStage = 'health' | 'tmdb' | 'youtube' | 'done';
+
+export interface ProcessingTaskView {
+  id: string;
+  scope: ProcessingTaskScope;
+  listId?: string;
+  listName?: string;
+  status: ProcessingTaskStatus;
+  dedupeKey: string;
+  cursorIndex: number;
+  totalItems: number;
+  processedItems: number;
+  approvedCount: number;
+  pendingBlockedCount: number;
+  offlineCount: number;
+  failedCount: number;
+  currentWorkId?: string;
+  currentTitle: string;
+  currentStage: ProcessingTaskStage;
+  lastNote?: string;
+  errorMessage?: string;
+  createdAt: number;
+  startedAt?: number;
+  updatedAt: number;
+  finishedAt?: number;
+}

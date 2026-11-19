@@ -284,6 +284,44 @@ export const migrationBackups = pgTable(
   (table) => [index('migration_backups_uid_idx').on(table.userUid)]
 );
 
+export const processingTasks = pgTable(
+  'processing_tasks',
+  {
+    id: text('id').primaryKey(),
+    userUid: text('user_uid')
+      .notNull()
+      .references(() => users.uid, { onDelete: 'cascade' }),
+    scope: text('scope').notNull(), // 'all_pending' | 'list'
+    listId: text('list_id'),
+    listName: text('list_name'),
+    status: text('status').notNull().default('queued'), // 'queued' | 'running' | 'paused' | 'completed' | 'cancelled' | 'failed'
+    dedupeKey: text('dedupe_key').notNull(),
+    targetWorkIdsJson: text('target_work_ids_json').notNull().default('[]'),
+    cursorIndex: integer('cursor_index').notNull().default(0),
+    totalItems: integer('total_items').notNull().default(0),
+    processedItems: integer('processed_items').notNull().default(0),
+    approvedCount: integer('approved_count').notNull().default(0),
+    pendingBlockedCount: integer('pending_blocked_count').notNull().default(0),
+    offlineCount: integer('offline_count').notNull().default(0),
+    failedCount: integer('failed_count').notNull().default(0),
+    currentWorkId: text('current_work_id'),
+    currentTitle: text('current_title').notNull().default(''),
+    currentStage: text('current_stage').notNull().default('health'),
+    lastNote: text('last_note'),
+    settingsJson: text('settings_json').notNull().default('{}'),
+    errorMessage: text('error_message'),
+    createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+    startedAt: bigint('started_at', { mode: 'number' }),
+    updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
+    finishedAt: bigint('finished_at', { mode: 'number' }),
+  },
+  (table) => [
+    index('processing_tasks_status_created_idx').on(table.status, table.createdAt),
+    index('processing_tasks_uid_created_idx').on(table.userUid, table.createdAt),
+    index('processing_tasks_dedupe_idx').on(table.dedupeKey),
+  ]
+);
+
 export const worksRelations = relations(works, ({ one, many }) => ({
   metadata: one(workMetadata, {
     fields: [works.id],
@@ -373,6 +411,14 @@ export const usersRelations = relations(users, ({ many }) => ({
   favorites: many(userFavorites),
   watchHistory: many(watchHistory),
   migrationBackups: many(migrationBackups),
+  processingTasks: many(processingTasks),
+}));
+
+export const processingTasksRelations = relations(processingTasks, ({ one }) => ({
+  user: one(users, {
+    fields: [processingTasks.userUid],
+    references: [users.uid],
+  }),
 }));
 
 export const userFavoritesRelations = relations(userFavorites, ({ one }) => ({

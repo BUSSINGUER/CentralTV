@@ -29,10 +29,21 @@ import {
   upsertUserWatchHistoryInPostgres,
   type ServerRecord,
 } from './src/db/catalogRepository.ts';
+import {
+  createOrEnqueueProcessingTask,
+  listProcessingTasksFromPostgres,
+} from './src/db/taskRepository.ts';
 import { requireAuth, type AuthRequest } from './src/middleware/auth.ts';
+import {
+  BackgroundTaskRunner,
+  type ServerProbeResult,
+  type ServerTmdbEnrichResult,
+  type ServerYoutubeSearchResult,
+} from './src/services/backgroundTaskRunner.ts';
 import type {
   CatalogItem,
   M3uListRecord,
+  ProcessingTaskScope,
   PublishStatus,
   WatchHistoryRecord,
 } from './src/types/streaming.ts';
@@ -952,9 +963,13 @@ export async function createServer(httpServer?: http.Server) {
   const resolveAndProbeStream = async (
     targetUrl: string,
     timeoutMs: number,
-    forceRefresh = false
+    forceRefresh = false,
+    externalSignal?: AbortSignal
   ): Promise<VodResolutionPayload> => {
     const startedAt = Date.now();
+    if (externalSignal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
     if (!isValidHttpUrl(targetUrl)) {
       return {
         ok: false,
@@ -1009,6 +1024,8 @@ export async function createServer(httpServer?: http.Server) {
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const onExternalAbort = () => controller.abort(externalSignal?.reason);
+    externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
 
     try {
       const { response: getResp, finalUrl, redirects } =
@@ -1218,6 +1235,9 @@ export async function createServer(httpServer?: http.Server) {
 
       return payload;
     } catch (err) {
+      if (externalSignal?.aborted) {
+        throw err;
+      }
       return {
         ok: false,
         validationState: 'offline',
@@ -1235,6 +1255,7 @@ export async function createServer(httpServer?: http.Server) {
       };
     } finally {
       clearTimeout(timeout);
+      externalSignal?.removeEventListener('abort', onExternalAbort);
     }
   };
 
@@ -1741,32 +1762,32 @@ export async function createServer(httpServer?: http.Server) {
     }
   });
 
-  // 5. TMDB Enrichment Proxy (pt-BR + Watch Providers BR + Networks)
-  app.post('/api/tmdb/enrich', async (req, res) => {
-    const body = (req.body || {}) as {
-      title?: string;
-      year?: number;
-      type?: string;
-      tmdbApiKey?: string;
-    };
-
-    const apiKey = (body.tmdbApiKey || process.env.TMDB_API_KEY || '').trim();
+  // 5. Shared Server Helpers + TMDB Enrichment & YouTube Trailer Search
+  const enrichTmdbServer = async (params: {
+    title: string;
+    year?: number;
+    type?: string;
+    tmdbApiKey?: string;
+    signal?: AbortSignal;
+  }): Promise<ServerTmdbEnrichResult> => {
+    const apiKey = (params.tmdbApiKey || process.env.TMDB_API_KEY || '').trim();
     if (!apiKey) {
-      res.status(400).json({
-        error: 'TMDB API Key não configurada.',
+      return {
         missingKey: true,
-      });
-      return;
+        error: 'TMDB API Key não configurada.',
+      };
     }
 
-    const title = String(body.title || '').trim();
+    const title = String(params.title || '').trim();
     if (!title) {
-      res.status(400).json({ error: 'Título ausente para busca no TMDB.' });
-      return;
+      return {
+        found: false,
+        error: 'Título ausente para busca no TMDB.',
+      };
     }
 
     const mediaKind =
-      body.type === 'series' || body.type === 'serie' ? 'tv' : 'movie';
+      params.type === 'series' || params.type === 'serie' ? 'tv' : 'movie';
     const isBearer = apiKey.length > 45;
 
     const tmdbFetch = async (endpoint: string) => {
@@ -1774,20 +1795,40 @@ export async function createServer(httpServer?: http.Server) {
       if (!isBearer) {
         url.searchParams.set('api_key', apiKey);
       }
-      const resp = await fetch(url.toString(), {
-        headers: isBearer
-          ? { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' }
-          : { Accept: 'application/json' },
-        signal: AbortSignal.timeout(10000),
-      });
-      if (!resp.ok) {
-        const err = new Error(`TMDB HTTP ${resp.status}`) as Error & {
-          statusCode?: number;
-        };
-        err.statusCode = resp.status;
-        throw err;
+
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        if (params.signal?.aborted) {
+          throw new DOMException('Aborted', 'AbortError');
+        }
+        const combinedSignal = params.signal
+          ? AbortSignal.any([params.signal, AbortSignal.timeout(10000)])
+          : AbortSignal.timeout(10000);
+        const resp = await fetch(url.toString(), {
+          headers: isBearer
+            ? { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' }
+            : { Accept: 'application/json' },
+          signal: combinedSignal,
+        });
+        if (
+          attempt < 2 &&
+          (resp.status === 429 ||
+            resp.status === 502 ||
+            resp.status === 503 ||
+            resp.status === 504)
+        ) {
+          await new Promise((r) => setTimeout(r, 700));
+          continue;
+        }
+        if (!resp.ok) {
+          const err = new Error(`TMDB HTTP ${resp.status}`) as Error & {
+            statusCode?: number;
+          };
+          err.statusCode = resp.status;
+          throw err;
+        }
+        return resp.json() as Promise<Record<string, unknown>>;
       }
-      return resp.json() as Promise<Record<string, unknown>>;
+      throw new Error('TMDB timeout');
     };
 
     try {
@@ -1796,10 +1837,10 @@ export async function createServer(httpServer?: http.Server) {
         language: 'pt-BR',
         include_adult: 'false',
       });
-      if (body.year) {
+      if (params.year) {
         searchParams.set(
           mediaKind === 'movie' ? 'year' : 'first_air_date_year',
-          String(body.year)
+          String(params.year)
         );
       }
 
@@ -1807,7 +1848,7 @@ export async function createServer(httpServer?: http.Server) {
         `/search/${mediaKind}?${searchParams.toString()}`
       )) as { results?: Array<{ id: number }> };
 
-      if ((!searchData.results || searchData.results.length === 0) && body.year) {
+      if ((!searchData.results || searchData.results.length === 0) && params.year) {
         searchParams.delete(
           mediaKind === 'movie' ? 'year' : 'first_air_date_year'
         );
@@ -1818,8 +1859,7 @@ export async function createServer(httpServer?: http.Server) {
 
       const firstMatch = searchData.results?.[0];
       if (!firstMatch) {
-        res.json({ found: false });
-        return;
+        return { found: false };
       }
 
       const details = (await tmdbFetch(
@@ -1917,11 +1957,11 @@ export async function createServer(httpServer?: http.Server) {
           (v) => v.site === 'YouTube' && v.type === 'Trailer'
         );
 
-      res.json({
+      return {
         found: true,
         tmdbId: details.id,
         title: details.title || details.name || title,
-        year: parsedYear || body.year,
+        year: parsedYear || params.year,
         synopsis: details.overview || '',
         voteAverage:
           typeof details.vote_average === 'number'
@@ -1940,29 +1980,34 @@ export async function createServer(httpServer?: http.Server) {
           : undefined,
         platform: detectedPlatform,
         youtubeTrailerId: ytVideo?.key,
-      });
+      };
     } catch (err) {
+      if ((err as { name?: string })?.name === 'AbortError') {
+        throw err;
+      }
       const upstreamStatus = (err as { statusCode?: number })?.statusCode;
-      const status =
-        upstreamStatus === 429 || upstreamStatus === 401
-          ? upstreamStatus
-          : 502;
-      res.status(status).json({
+      return {
+        found: false,
+        statusCode:
+          upstreamStatus === 429 || upstreamStatus === 401
+            ? upstreamStatus
+            : 502,
         error: err instanceof Error ? err.message : 'Erro na API do TMDB.',
-      });
+      };
     }
-  });
+  };
 
-  // 6. YouTube Trailer Search (Data API v3 or automatic embed search fallback)
-  app.get('/api/youtube/search', async (req, res) => {
-    const query = String(req.query.q || '').trim();
-    if (!query) {
-      res.status(400).json({ error: 'Consulta vazia.' });
-      return;
-    }
+  const searchYoutubeServer = async (params: {
+    query: string;
+    youtubeApiKey?: string;
+    signal?: AbortSignal;
+  }): Promise<ServerYoutubeSearchResult> => {
+    const query = String(params.query || '').trim();
+    if (!query) return { videoId: null, source: 'none' };
 
-    const headerKey = String(req.headers['x-youtube-key'] || '').trim();
-    const apiKey = headerKey || (process.env.YOUTUBE_API_KEY || '').trim();
+    const apiKey =
+      (params.youtubeApiKey || '').trim() ||
+      (process.env.YOUTUBE_API_KEY || '').trim();
 
     if (apiKey) {
       try {
@@ -1974,25 +2019,27 @@ export async function createServer(httpServer?: http.Server) {
         ytUrl.searchParams.set('q', query);
         ytUrl.searchParams.set('key', apiKey);
 
-        const ytResp = await fetch(ytUrl.toString(), {
-          signal: AbortSignal.timeout(8000),
-        });
+        const combinedSignal = params.signal
+          ? AbortSignal.any([params.signal, AbortSignal.timeout(8000)])
+          : AbortSignal.timeout(8000);
+        const ytResp = await fetch(ytUrl.toString(), { signal: combinedSignal });
         if (ytResp.ok) {
           const data = (await ytResp.json()) as {
             items?: Array<{ id?: { videoId?: string }; snippet?: { title?: string } }>;
           };
           const first = data.items?.find((i) => i.id?.videoId);
           if (first?.id?.videoId) {
-            res.json({
+            return {
               videoId: first.id.videoId,
               title: first.snippet?.title || query,
               source: 'youtube-api',
-            });
-            return;
+            };
           }
         }
-      } catch {
-        // Fall through to automatic embed search fallback
+      } catch (err) {
+        if ((err as { name?: string })?.name === 'AbortError') {
+          throw err;
+        }
       }
     }
 
@@ -2000,33 +2047,240 @@ export async function createServer(httpServer?: http.Server) {
       const searchPageUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(
         query
       )}`;
+      const combinedSignal = params.signal
+        ? AbortSignal.any([params.signal, AbortSignal.timeout(8000)])
+        : AbortSignal.timeout(8000);
       const pageResp = await fetch(searchPageUrl, {
         headers: {
           'User-Agent':
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
           'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
         },
-        signal: AbortSignal.timeout(8000),
+        signal: combinedSignal,
       });
 
       if (pageResp.ok) {
         const html = await pageResp.text();
         const match = html.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
         if (match?.[1]) {
-          res.json({
+          return {
             videoId: match[1],
             title: query,
             source: 'youtube-fallback',
-          });
-          return;
+          };
         }
       }
-    } catch {
-      // Ignore network fallback failure
+    } catch (err) {
+      if ((err as { name?: string })?.name === 'AbortError') {
+        throw err;
+      }
     }
 
-    res.json({ videoId: null, source: 'none' });
+    return { videoId: null, source: 'none' };
+  };
+
+  app.post('/api/tmdb/enrich', async (req, res) => {
+    const body = (req.body || {}) as {
+      title?: string;
+      year?: number;
+      type?: string;
+      tmdbApiKey?: string;
+    };
+
+    const title = String(body.title || '').trim();
+    if (!title) {
+      res.status(400).json({ error: 'Título ausente para busca no TMDB.' });
+      return;
+    }
+
+    const result = await enrichTmdbServer({
+      title,
+      year: body.year,
+      type: body.type,
+      tmdbApiKey: body.tmdbApiKey,
+    });
+
+    if (result.missingKey) {
+      res.status(400).json({
+        error: result.error,
+        missingKey: true,
+      });
+      return;
+    }
+
+    if (result.statusCode) {
+      res.status(result.statusCode).json({
+        error: result.error || 'Erro na API do TMDB.',
+      });
+      return;
+    }
+
+    res.json(result);
   });
+
+  // 6. YouTube Trailer Search (Data API v3 or automatic embed search fallback)
+  app.get('/api/youtube/search', async (req, res) => {
+    const query = String(req.query.q || '').trim();
+    if (!query) {
+      res.status(400).json({ error: 'Consulta vazia.' });
+      return;
+    }
+
+    const headerKey = String(req.headers['x-youtube-key'] || '').trim();
+    const result = await searchYoutubeServer({
+      query,
+      youtubeApiKey: headerKey,
+    });
+    res.json(result);
+  });
+
+  const taskRunner = new BackgroundTaskRunner({
+    probeStream: async (url, timeoutMs, signal): Promise<ServerProbeResult> => {
+      const probe = await resolveAndProbeStream(url, timeoutMs, false, signal);
+      return {
+        ok: probe.ok,
+        validationState: probe.validationState,
+        status: probe.status,
+        resolvedUrl: probe.resolvedUrl,
+        mediaType: probe.mediaType,
+        latencyMs: probe.latencyMs,
+        reason: probe.reason,
+      };
+    },
+    enrichTmdb: enrichTmdbServer,
+    searchYoutube: searchYoutubeServer,
+  });
+  app.locals.taskRunner = taskRunner;
+  httpServer?.on('close', () => {
+    void taskRunner.shutdown();
+  });
+
+  // 6b. Phase 02 Background Processing Tasks Routes
+  app.get('/api/tasks/processing', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const tasks = await listProcessingTasksFromPostgres(req.user!.uid, 25);
+      res.json({ tasks });
+    } catch (error) {
+      console.error('GET /api/tasks/processing failed:', error);
+      res.status(500).json({
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Falha ao consultar tarefas em segundo plano.',
+      });
+    }
+  });
+
+  app.post('/api/tasks/processing', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const body = (req.body || {}) as {
+        scope?: ProcessingTaskScope;
+        listId?: string;
+        listName?: string;
+        tmdbApiKey?: string;
+        youtubeApiKey?: string;
+        batchSize?: number;
+        probeTimeoutMs?: number;
+      };
+      const scope: ProcessingTaskScope =
+        body.scope === 'list' && body.listId ? 'list' : 'all_pending';
+
+      const created = await createOrEnqueueProcessingTask({
+        userUid: req.user!.uid,
+        scope,
+        listId: body.listId,
+        listName: body.listName,
+        settings: {
+          tmdbApiKey: body.tmdbApiKey,
+          youtubeApiKey: body.youtubeApiKey,
+          batchSize: body.batchSize,
+          probeTimeoutMs: body.probeTimeoutMs,
+        },
+      });
+
+      if (created.task && created.task.status === 'running') {
+        void taskRunner.kick(created.task.id);
+      } else if (created.task && created.task.status === 'queued') {
+        void taskRunner.drainQueue();
+      }
+
+      res.json(created);
+    } catch (error) {
+      console.error('POST /api/tasks/processing failed:', error);
+      res.status(500).json({
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Falha ao iniciar tarefa em segundo plano.',
+      });
+    }
+  });
+
+  app.post(
+    '/api/tasks/processing/:id/pause',
+    requireAuth,
+    async (req: AuthRequest, res) => {
+      try {
+        const taskId = String(req.params.id || '').trim();
+        const task = await taskRunner.pauseTask(taskId, req.user!.uid);
+        if (!task) {
+          res.status(404).json({ error: 'Tarefa não encontrada.' });
+          return;
+        }
+        res.json({ task });
+      } catch (error) {
+        console.error('POST /api/tasks/processing/:id/pause failed:', error);
+        res.status(500).json({
+          error:
+            error instanceof Error ? error.message : 'Falha ao pausar tarefa.',
+        });
+      }
+    }
+  );
+
+  app.post(
+    '/api/tasks/processing/:id/resume',
+    requireAuth,
+    async (req: AuthRequest, res) => {
+      try {
+        const taskId = String(req.params.id || '').trim();
+        const task = await taskRunner.resumeTask(taskId, req.user!.uid);
+        if (!task) {
+          res.status(404).json({ error: 'Tarefa não encontrada.' });
+          return;
+        }
+        res.json({ task });
+      } catch (error) {
+        console.error('POST /api/tasks/processing/:id/resume failed:', error);
+        res.status(500).json({
+          error:
+            error instanceof Error ? error.message : 'Falha ao retomar tarefa.',
+        });
+      }
+    }
+  );
+
+  app.post(
+    '/api/tasks/processing/:id/cancel',
+    requireAuth,
+    async (req: AuthRequest, res) => {
+      try {
+        const taskId = String(req.params.id || '').trim();
+        const task = await taskRunner.cancelTask(taskId, req.user!.uid);
+        if (!task) {
+          res.status(404).json({ error: 'Tarefa não encontrada.' });
+          return;
+        }
+        res.json({ task });
+      } catch (error) {
+        console.error('POST /api/tasks/processing/:id/cancel failed:', error);
+        res.status(500).json({
+          error:
+            error instanceof Error ? error.message : 'Falha ao cancelar tarefa.',
+        });
+      }
+    }
+  );
 
   // 7. Phase 02: Persistent Catalog, Decoupled Lists, User Library/History & Migration Routes
   app.get('/api/catalog', requireAuth, async (req: AuthRequest, res) => {
@@ -2649,17 +2903,12 @@ export async function createServer(httpServer?: http.Server) {
 
   if (!isProduction) {
     const { createServer: createViteServer } = await import('vite');
-    const hmrEnabled = process.env.DISABLE_HMR !== 'true';
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
         allowedHosts: ['localhost', '127.0.0.1', '.run.app'],
-        hmr: hmrEnabled,
-        ws: hmrEnabled
-          ? httpServer
-            ? { server: httpServer }
-            : undefined
-          : false,
+        hmr: false,
+        ws: false,
       },
       appType: 'spa',
     });
@@ -2697,11 +2946,23 @@ if (isDirectExecution) {
       httpServer.on('request', app);
       httpServer.listen(PORT, '0.0.0.0', () => {
         console.log(`Aura Stream server running at http://localhost:${PORT}`);
+        // Automatically resume interrupted background tasks once HTTP server is listening
+        setTimeout(() => {
+          const runner = app.locals.taskRunner as
+            | BackgroundTaskRunner
+            | undefined;
+          void runner?.recoverInterruptedTasks();
+        }, 250).unref();
       });
 
       const shutdown = () => {
-        httpServer.close(() => {
-          process.exit(0);
+        const runner = app.locals.taskRunner as
+          | BackgroundTaskRunner
+          | undefined;
+        void Promise.resolve(runner?.shutdown()).finally(() => {
+          httpServer.close(() => {
+            process.exit(0);
+          });
         });
         setTimeout(() => process.exit(0), 3000).unref();
       };

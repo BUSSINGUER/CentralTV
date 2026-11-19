@@ -7,6 +7,8 @@ import { auth } from '../lib/firebase';
 import {
   CatalogItem,
   M3uListRecord,
+  ProcessingTaskScope,
+  ProcessingTaskView,
   WatchHistoryRecord,
 } from '../types/streaming';
 
@@ -496,4 +498,121 @@ export async function rollbackServerMigration(backupId: string): Promise<{
   }
   await pullAuthoritativeStateFromServer({ replaceEmpty: true });
   return data;
+}
+
+export async function fetchProcessingTasks(): Promise<ProcessingTaskView[]> {
+  const headers = await getBearerHeaders();
+  if (!headers) return [];
+  try {
+    const resp = await fetch('/api/tasks/processing', { headers });
+    if (!resp.ok) return [];
+    const data = (await resp.json()) as { tasks?: ProcessingTaskView[] };
+    return data.tasks || [];
+  } catch {
+    return [];
+  }
+}
+
+export async function startProcessingTask(params: {
+  scope: ProcessingTaskScope;
+  listId?: string;
+  listName?: string;
+  tmdbApiKey?: string;
+  youtubeApiKey?: string;
+  batchSize?: number;
+  probeTimeoutMs?: number;
+}): Promise<{
+  task: ProcessingTaskView | null;
+  deduplicated: boolean;
+  queued: boolean;
+  empty?: boolean;
+}> {
+  const headers = await getBearerHeaders();
+  if (!headers) {
+    throw new Error('Autenticação necessária para iniciar processamento em segundo plano.');
+  }
+  const resp = await fetch('/api/tasks/processing', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(params),
+  });
+  const data = (await resp.json().catch(() => ({}))) as {
+    task?: ProcessingTaskView | null;
+    deduplicated?: boolean;
+    queued?: boolean;
+    empty?: boolean;
+    error?: string;
+  };
+  if (!resp.ok) {
+    throw new Error(data.error || 'Falha ao iniciar tarefa em segundo plano.');
+  }
+  return {
+    task: data.task ?? null,
+    deduplicated: Boolean(data.deduplicated),
+    queued: Boolean(data.queued),
+    empty: Boolean(data.empty),
+  };
+}
+
+export async function pauseProcessingTask(
+  taskId: string
+): Promise<ProcessingTaskView | null> {
+  const headers = await getBearerHeaders();
+  if (!headers) {
+    throw new Error('Autenticação necessária.');
+  }
+  const resp = await fetch(
+    `/api/tasks/processing/${encodeURIComponent(taskId)}/pause`,
+    { method: 'POST', headers }
+  );
+  const data = (await resp.json().catch(() => ({}))) as {
+    task?: ProcessingTaskView | null;
+    error?: string;
+  };
+  if (!resp.ok) {
+    throw new Error(data.error || 'Falha ao pausar tarefa.');
+  }
+  return data.task ?? null;
+}
+
+export async function resumeProcessingTask(
+  taskId: string
+): Promise<ProcessingTaskView | null> {
+  const headers = await getBearerHeaders();
+  if (!headers) {
+    throw new Error('Autenticação necessária.');
+  }
+  const resp = await fetch(
+    `/api/tasks/processing/${encodeURIComponent(taskId)}/resume`,
+    { method: 'POST', headers }
+  );
+  const data = (await resp.json().catch(() => ({}))) as {
+    task?: ProcessingTaskView | null;
+    error?: string;
+  };
+  if (!resp.ok) {
+    throw new Error(data.error || 'Falha ao retomar tarefa.');
+  }
+  return data.task ?? null;
+}
+
+export async function cancelProcessingTask(
+  taskId: string
+): Promise<ProcessingTaskView | null> {
+  const headers = await getBearerHeaders();
+  if (!headers) {
+    throw new Error('Autenticação necessária.');
+  }
+  const resp = await fetch(
+    `/api/tasks/processing/${encodeURIComponent(taskId)}/cancel`,
+    { method: 'POST', headers }
+  );
+  const data = (await resp.json().catch(() => ({}))) as {
+    task?: ProcessingTaskView | null;
+    error?: string;
+  };
+  if (!resp.ok) {
+    throw new Error(data.error || 'Falha ao cancelar tarefa.');
+  }
+  return data.task ?? null;
 }

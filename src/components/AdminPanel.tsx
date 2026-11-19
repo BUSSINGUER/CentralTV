@@ -53,12 +53,18 @@ import { useAuth } from '../contexts/AuthContext';
 import { auth } from '../lib/firebase';
 import { ServerRecord } from '../db/catalogRepository';
 import {
+  cancelProcessingTask,
   deleteWorkOnServer,
   fetchMigrationBackups,
+  fetchProcessingTasks,
+  pauseProcessingTask,
+  pullAuthoritativeStateFromServer,
   restoreLocalBackupSnapshot,
+  resumeProcessingTask,
   rollbackServerMigration,
   runIndexedDbMigrationToServer,
   ServerMigrationBackupItem,
+  startProcessingTask,
   syncCatalogItemsToServer,
   syncWorkPatchToServer,
 } from '../services/persistenceSync';
@@ -73,6 +79,7 @@ import {
   M3uListRecord,
   MediaKind,
   PlatformId,
+  ProcessingTaskView,
   PublishStatus,
 } from '../types/streaming';
 import { MediaImage } from './MediaImage';
@@ -319,7 +326,7 @@ export function AdminPanel({
   // Reclassify status
   const [reclassifyMsg, setReclassifyMsg] = useState<string | null>(null);
 
-  // Pipeline state
+  // Pipeline state (synced with backend persistent processing_tasks)
   const [pipeline, setPipeline] = useState<PipelineProgress>({
     running: false,
     paused: false,
@@ -332,10 +339,11 @@ export function AdminPanel({
     currentTitle: '',
     currentStage: 'health',
   });
-  const pipelineRunningRef = useRef(false);
-  const pipelineAbortRef = useRef<AbortController | null>(null);
-  const pauseFlagRef = useRef(false);
-  const cancelFlagRef = useRef(false);
+  const [activeTask, setActiveTask] = useState<ProcessingTaskView | null>(null);
+  const [queuedTasks, setQueuedTasks] = useState<ProcessingTaskView[]>([]);
+  const [verifyingListId, setVerifyingListId] = useState<string | null>(null);
+  const activeTaskRef = useRef<ProcessingTaskView | null>(null);
+  const lastObservedTaskSigRef = useRef<string>('');
   const [busyItemId, setBusyItemId] = useState<string | null>(null);
 
   // Settings form state
@@ -353,7 +361,7 @@ export function AdminPanel({
   const [youtubeLocked, setYoutubeLocked] = useState(true);
   const [settingsSavedMsg, setSettingsSavedMsg] = useState(false);
 
-  const refreshItems = async () => {
+  const refreshItems = useCallback(async () => {
     try {
       const [all, epg, lists, backups] = await Promise.all([
         db.mediaItems.orderBy('createdAt').reverse().toArray(),
@@ -372,19 +380,101 @@ export function AdminPanel({
     } finally {
       setLoadingDb(false);
     }
-  };
+  }, [user, onCatalogChanged]);
+
+  const applyServerTasksSnapshot = useCallback(
+    async (tasks: ProcessingTaskView[]) => {
+      const primary =
+        tasks.find((t) => t.status === 'running') ||
+        tasks.find((t) => t.status === 'paused') ||
+        tasks.find((t) => t.status === 'queued') ||
+        tasks.find(
+          (t) =>
+            activeTaskRef.current?.id === t.id ||
+            Date.now() - t.updatedAt < 5 * 60 * 1000
+        ) ||
+        null;
+
+      const remainingQueued = tasks.filter(
+        (t) => t.status === 'queued' && t.id !== primary?.id
+      );
+
+      setQueuedTasks(remainingQueued);
+      setActiveTask(primary);
+      activeTaskRef.current = primary;
+
+      if (!primary) return;
+
+      const isActive =
+        primary.status === 'running' ||
+        primary.status === 'paused' ||
+        primary.status === 'queued';
+
+      setPipeline({
+        running: isActive,
+        paused: primary.status === 'paused',
+        processed: primary.processedItems,
+        total: primary.totalItems,
+        approved: primary.approvedCount,
+        pendingCors: primary.pendingBlockedCount,
+        offline: primary.offlineCount,
+        failed: primary.failedCount,
+        currentTitle:
+          primary.currentTitle ||
+          (primary.listName ? `Lista: ${primary.listName}` : 'Catálogo'),
+        currentStage: primary.currentStage || 'health',
+        lastNote: primary.lastNote,
+      });
+
+      const sig = `${primary.id}:${primary.status}:${primary.processedItems}`;
+      if (sig !== lastObservedTaskSigRef.current) {
+        const hadPrior = Boolean(lastObservedTaskSigRef.current);
+        lastObservedTaskSigRef.current = sig;
+        if (hadPrior && user) {
+          await pullAuthoritativeStateFromServer().catch(() => {});
+          await refreshItems();
+        }
+      }
+    },
+    [user, refreshItems]
+  );
+
+  const syncTasksFromServer = useCallback(async () => {
+    if (!user) return;
+    const tasks = await fetchProcessingTasks();
+    await applyServerTasksSnapshot(tasks);
+  }, [user, applyServerTasksSnapshot]);
 
   useEffect(() => {
-    void refreshItems();
-  }, [user]);
-
-  useEffect(() => {
-    return () => {
-      cancelFlagRef.current = true;
-      pauseFlagRef.current = false;
-      pipelineAbortRef.current?.abort();
+    let active = true;
+    const bootstrap = async () => {
+      if (user) {
+        await pullAuthoritativeStateFromServer().catch(() => {});
+      }
+      if (!active) return;
+      await refreshItems();
+      if (user && active) {
+        await syncTasksFromServer();
+      }
     };
-  }, []);
+    void bootstrap();
+    return () => {
+      active = false;
+    };
+  }, [user, refreshItems, syncTasksFromServer]);
+
+  useEffect(() => {
+    if (!user) return;
+    const shouldPoll =
+      activeTask?.status === 'running' || activeTask?.status === 'queued';
+    if (!shouldPoll) return;
+
+    const timer = window.setInterval(() => {
+      void syncTasksFromServer();
+    }, 1800);
+
+    return () => window.clearInterval(timer);
+  }, [user, activeTask?.status, syncTasksFromServer]);
 
   useEffect(() => {
     setActiveTab(initialTab);
@@ -714,181 +804,174 @@ export function AdminPanel({
     );
   };
 
-  // Pipeline Batch Processing
+  // Pipeline Background Task Processing (decoupled from React lifecycle)
   const handleRunBatchPipeline = async () => {
-    if (pipelineRunningRef.current) return;
+    if (!user) {
+      setPipeline((prev) => ({
+        ...prev,
+        lastNote:
+          'Faça login na sua conta para executar o processamento persistente em segundo plano.',
+      }));
+      return;
+    }
 
     const pendingItems = items.filter(
       (i) => (i.status || 'pendente') === 'pendente'
     );
     if (pendingItems.length === 0) return;
 
-    pipelineRunningRef.current = true;
-    pauseFlagRef.current = false;
-    cancelFlagRef.current = false;
-    const abortController = new AbortController();
-    pipelineAbortRef.current = abortController;
-
-    let processed = 0;
-    let approved = 0;
-    let pendingCors = 0;
-    let offline = 0;
-    let failed = 0;
-
-    setPipeline({
-      running: true,
-      paused: false,
-      processed: 0,
-      total: pendingItems.length,
-      approved: 0,
-      pendingCors: 0,
-      offline: 0,
-      failed: 0,
-      currentTitle: pendingItems[0].title,
-      currentStage: 'health',
-      lastNote: undefined,
-    });
-
-    const chunkSize = Math.min(12, Math.max(1, settings.batchSize || 4));
-
     try {
-      for (let i = 0; i < pendingItems.length; i += chunkSize) {
-        if (cancelFlagRef.current) break;
-
-        while (pauseFlagRef.current) {
-          if (cancelFlagRef.current) break;
-          await new Promise((r) => setTimeout(r, 250));
-        }
-        if (cancelFlagRef.current) break;
-
-        const batch = pendingItems.slice(i, i + chunkSize);
-        const chunkResults = await Promise.allSettled(
-          batch.map(async (item) => {
-            if (cancelFlagRef.current || abortController.signal.aborted) {
-              return null;
-            }
-            try {
-              const updated = await processItemFullPipeline(
-                item,
-                settings,
-                (stage, note) => {
-                  setPipeline((prev) => ({
-                    ...prev,
-                    currentTitle: item.title,
-                    currentStage: stage,
-                    lastNote: note || prev.lastNote,
-                  }));
-                },
-                {
-                  signal: abortController.signal,
-                  skipServerSync: true,
-                }
-              );
-
-              processed += 1;
-              if (updated.status === 'aprovado') approved += 1;
-              else if (updated.status === 'offline') offline += 1;
-              else if (updated.status === 'pendente') pendingCors += 1;
-
-              setPipeline((prev) => ({
-                ...prev,
-                processed,
-                approved,
-                pendingCors,
-                offline,
-                failed,
-              }));
-
-              return updated;
-            } catch (err) {
-              if ((err as Error)?.name === 'AbortError') {
-                return null;
-              }
-              failed += 1;
-              processed += 1;
-              const errMsg =
-                err instanceof Error
-                  ? err.message
-                  : 'Erro inesperado ao processar item.';
-              console.error(
-                `[Pipeline] Falha ao processar "${item.title}":`,
-                err
-              );
-              const erroredItem: CatalogItem = {
-                ...item,
-                lastError: errMsg,
-                updatedAt: Date.now(),
-              };
-              await db.mediaItems.put(erroredItem).catch(() => {});
-              setPipeline((prev) => ({
-                ...prev,
-                processed,
-                failed,
-                lastNote: `Falha em "${item.title}": ${errMsg}`,
-              }));
-              return erroredItem;
-            }
-          })
-        );
-
-        const updatedItems = chunkResults
-          .map((res) => (res.status === 'fulfilled' ? res.value : null))
-          .filter((val): val is CatalogItem => Boolean(val));
-
-        if (updatedItems.length > 0) {
-          const updatedById = new Map(updatedItems.map((u) => [u.id, u]));
-          setItems((prev) => prev.map((it) => updatedById.get(it.id) || it));
-
-          const syncRes = await syncCatalogItemsToServer(updatedItems);
-          if (!syncRes.synced && syncRes.error) {
-            setPipeline((prev) => ({
-              ...prev,
-              lastNote: `Salvo localmente; aviso na nuvem: ${syncRes.error}`,
-            }));
-          }
-        }
-
-        // Yield briefly between batches to keep UI responsive and avoid API burst limits
-        if (i + chunkSize < pendingItems.length && !cancelFlagRef.current) {
-          await new Promise((r) => setTimeout(r, 120));
-        }
+      const syncRes = await syncCatalogItemsToServer(pendingItems);
+      if (!syncRes.synced && syncRes.error) {
+        setPipeline((prev) => ({
+          ...prev,
+          lastNote: `Aviso ao sincronizar pendentes antes da fila: ${syncRes.error}`,
+        }));
       }
-    } catch (fatalErr) {
-      const msg =
-        fatalErr instanceof Error
-          ? fatalErr.message
-          : 'Erro inesperado no processamento em lote.';
-      console.error('[Pipeline] Fatal batch error:', fatalErr);
+
+      const res = await startProcessingTask({
+        scope: 'all_pending',
+        tmdbApiKey: settings.tmdbApiKey,
+        youtubeApiKey: settings.youtubeApiKey,
+        batchSize: settings.batchSize,
+        probeTimeoutMs: settings.probeTimeoutMs,
+      });
+
+      if (res.empty || !res.task) {
+        setPipeline((prev) => ({
+          ...prev,
+          lastNote: 'Nenhum título pendente encontrado no acervo persistente.',
+        }));
+        return;
+      }
+
+      await syncTasksFromServer();
+      if (res.deduplicated) {
+        setPipeline((prev) => ({
+          ...prev,
+          lastNote:
+            res.task?.status === 'paused'
+              ? 'Já existe uma tarefa global pausada no servidor. Use Retomar ou Cancelar.'
+              : 'Já existe uma verificação global em andamento no servidor.',
+        }));
+      } else if (res.queued) {
+        setPipeline((prev) => ({
+          ...prev,
+          lastNote:
+            'Nova tarefa enfileirada automaticamente após a verificação atual.',
+        }));
+      }
+    } catch (err) {
       setPipeline((prev) => ({
         ...prev,
-        lastNote: msg,
+        lastNote:
+          err instanceof Error
+            ? err.message
+            : 'Falha ao iniciar processamento em segundo plano.',
       }));
-    } finally {
-      pipelineRunningRef.current = false;
-      pipelineAbortRef.current = null;
-      const wasCancelled = cancelFlagRef.current;
-      setPipeline((prev) => ({
-        ...prev,
-        running: false,
-        paused: false,
-        currentStage: 'done',
-        lastNote: wasCancelled
-          ? `Processamento cancelado pelo usuário (${processed}/${pendingItems.length} concluídos).`
-          : prev.lastNote,
-      }));
-      await refreshItems();
     }
   };
 
-  const handleTogglePause = () => {
-    pauseFlagRef.current = !pauseFlagRef.current;
-    setPipeline((prev) => ({ ...prev, paused: pauseFlagRef.current }));
+  const handleVerifyListInBackground = async (list: M3uListRecord) => {
+    if (!user) {
+      setImportError(
+        'Faça login para iniciar a verificação persistente desta lista em segundo plano.'
+      );
+      return;
+    }
+
+    setVerifyingListId(list.id);
+    setImportError(null);
+    setListActionMsg(null);
+    try {
+      const listWorks = items.filter((item) => {
+        const rootHit = (item.sources || []).some((s) => s.listId === list.id);
+        const epHit = (item.episodes || []).some((ep) =>
+          (ep.sources || []).some((s) => s.listId === list.id)
+        );
+        return rootHit || epHit;
+      });
+      if (listWorks.length > 0) {
+        await syncCatalogItemsToServer(listWorks, list, true);
+      }
+
+      const res = await startProcessingTask({
+        scope: 'list',
+        listId: list.id,
+        listName: list.name,
+        tmdbApiKey: settings.tmdbApiKey,
+        youtubeApiKey: settings.youtubeApiKey,
+        batchSize: settings.batchSize,
+        probeTimeoutMs: settings.probeTimeoutMs,
+      });
+
+      await syncTasksFromServer();
+
+      if (res.empty || !res.task) {
+        setListActionMsg(
+          `A lista "${list.name}" não possui itens pendentes ou não publicados para verificar.`
+        );
+      } else if (res.deduplicated) {
+        setListActionMsg(
+          `A lista "${list.name}" já possui uma tarefa ${
+            res.task.status === 'queued'
+              ? 'na fila'
+              : res.task.status === 'paused'
+                ? 'pausada'
+                : 'em andamento'
+          } no servidor.`
+        );
+      } else if (res.queued) {
+        setListActionMsg(
+          `Verificação da lista "${list.name}" enfileirada automaticamente no servidor (${res.task.totalItems} itens).`
+        );
+      } else {
+        setListActionMsg(
+          `Verificação em segundo plano iniciada para "${list.name}" (${res.task.totalItems} itens). O processamento continuará no servidor mesmo se você sair desta página.`
+        );
+      }
+    } catch (err) {
+      setImportError(
+        err instanceof Error
+          ? err.message
+          : 'Erro ao iniciar verificação em segundo plano da lista.'
+      );
+    } finally {
+      setVerifyingListId(null);
+    }
   };
 
-  const handleCancelPipeline = () => {
-    cancelFlagRef.current = true;
-    pauseFlagRef.current = false;
-    pipelineAbortRef.current?.abort();
+  const handleTogglePause = async () => {
+    if (!activeTask) return;
+    try {
+      if (activeTask.status === 'paused') {
+        await resumeProcessingTask(activeTask.id);
+      } else {
+        await pauseProcessingTask(activeTask.id);
+      }
+      await syncTasksFromServer();
+    } catch (err) {
+      setPipeline((prev) => ({
+        ...prev,
+        lastNote:
+          err instanceof Error ? err.message : 'Falha ao alternar pausa da tarefa.',
+      }));
+    }
+  };
+
+  const handleCancelPipeline = async () => {
+    if (!activeTask) return;
+    try {
+      await cancelProcessingTask(activeTask.id);
+      await syncTasksFromServer();
+      await refreshItems();
+    } catch (err) {
+      setPipeline((prev) => ({
+        ...prev,
+        lastNote:
+          err instanceof Error ? err.message : 'Falha ao cancelar tarefa.',
+      }));
+    }
   };
 
   const handleProcessSingle = async (item: CatalogItem) => {
@@ -1734,7 +1817,11 @@ export function AdminPanel({
                                 ? 'Etapa B · TMDB pt-BR'
                                 : 'Etapa C · Trailer YouTube'
                           }): ${pipeline.currentTitle}`
-                      : `Lote finalizado · ${pipeline.approved} aprovados · ${pipeline.pendingCors || 0} pendentes (CORS/Proxy) · ${pipeline.offline} offline${pipeline.failed ? ` · ${pipeline.failed} falhas` : ''}`}
+                      : activeTask?.status === 'cancelled'
+                        ? `Cancelado pelo usuário · ${pipeline.processed}/${pipeline.total} itens processados`
+                        : `Lote finalizado · ${pipeline.approved} aprovados · ${pipeline.pendingCors || 0} pendentes (CORS/Proxy) · ${pipeline.offline} offline${pipeline.failed ? ` · ${pipeline.failed} falhas` : ''}`}
+                    {activeTask?.listName ? ` · Lista: ${activeTask.listName}` : ''}
+                    {queuedTasks.length > 0 ? ` · +${queuedTasks.length} na fila` : ''}
                   </span>
                   <span className="text-white/65 tabular-nums">
                     {pipeline.processed} / {pipeline.total}
@@ -2393,6 +2480,24 @@ export function AdminPanel({
                       </div>
 
                       <div className="flex shrink-0 flex-wrap items-center gap-2">
+                        {!isConfirming && (
+                          <button
+                            type="button"
+                            disabled={
+                              verifyingListId === list.id ||
+                              live.titleCount === 0 ||
+                              importing
+                            }
+                            onClick={() => void handleVerifyListInBackground(list)}
+                            className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-white/15 bg-[#181B20] px-3.5 text-xs font-semibold text-white hover:bg-white/10 disabled:opacity-45"
+                          >
+                            <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />
+                            {verifyingListId === list.id
+                              ? 'Agendando...'
+                              : 'Verificar Lista'}
+                          </button>
+                        )}
+
                         {canResync && !isConfirming && (
                           <button
                             type="button"
