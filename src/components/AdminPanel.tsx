@@ -430,7 +430,10 @@ export function AdminPanel({
       if (sig !== lastObservedTaskSigRef.current) {
         const hadPrior = Boolean(lastObservedTaskSigRef.current);
         lastObservedTaskSigRef.current = sig;
-        if (hadPrior && user) {
+        // Progress is already carried by the task snapshot. Pulling the entire
+        // 45k+ catalog on every 1.8s progress tick creates a repeated network,
+        // JSON and IndexedDB memory spike. Refresh the catalog once at the end.
+        if (hadPrior && user && !isActive) {
           await pullAuthoritativeStateFromServer().catch(() => {});
           await refreshItems();
         }
@@ -815,27 +818,44 @@ export function AdminPanel({
       return;
     }
 
-    const pendingItems = items.filter(
-      (i) => (i.status || 'pendente') === 'pendente'
-    );
-    if (pendingItems.length === 0) return;
+    if (counts.pendente === 0) return;
 
     try {
-      const syncRes = await syncCatalogItemsToServer(pendingItems);
-      if (!syncRes.synced && syncRes.error) {
-        setPipeline((prev) => ({
-          ...prev,
-          lastNote: `Aviso ao sincronizar pendentes antes da fila: ${syncRes.error}`,
-        }));
-      }
-
-      const res = await startProcessingTask({
+      // PostgreSQL is authoritative. Starting from it avoids serializing and
+      // uploading the entire IndexedDB queue again on every click (45k+ items
+      // can otherwise cause a large browser/server memory spike).
+      let res = await startProcessingTask({
         scope: 'all_pending',
         tmdbApiKey: settings.tmdbApiKey,
         youtubeApiKey: settings.youtubeApiKey,
         batchSize: settings.batchSize,
         probeTimeoutMs: settings.probeTimeoutMs,
       });
+
+      // Compatibility path for a user whose catalog still exists only in the
+      // old IndexedDB cache. This runs only when the persistent catalog is empty.
+      if (res.empty) {
+        setPipeline((prev) => ({
+          ...prev,
+          lastNote: 'Preparando o acervo local para o primeiro processamento…',
+        }));
+        const pendingItems = items.filter(
+          (i) => (i.status || 'pendente') === 'pendente'
+        );
+        const syncRes = await syncCatalogItemsToServer(pendingItems);
+        if (!syncRes.synced) {
+          throw new Error(
+            syncRes.error || 'Falha ao preparar o acervo local no servidor.'
+          );
+        }
+        res = await startProcessingTask({
+          scope: 'all_pending',
+          tmdbApiKey: settings.tmdbApiKey,
+          youtubeApiKey: settings.youtubeApiKey,
+          batchSize: settings.batchSize,
+          probeTimeoutMs: settings.probeTimeoutMs,
+        });
+      }
 
       if (res.empty || !res.task) {
         setPipeline((prev) => ({

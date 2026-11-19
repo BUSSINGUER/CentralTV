@@ -509,33 +509,48 @@ export async function runYoutubeSearchForItem(
   return { ...item, youtubeEnriched: true, updatedAt: Date.now() };
 }
 
-/**
- * Fetches missing YouTube trailer on-demand when opening DetailsModal or Hero
- * and caches it in IndexedDB.
- */
-export async function fetchAndCacheTrailerOnDemand(
-  item: CatalogItem,
-  youtubeApiKey: string
-): Promise<string | null> {
-  if (item.youtubeTrailerId) return item.youtubeTrailerId;
-  if (item.type === 'live' || item.type === 'radio') return null;
+const onDemandEnrichmentRequests = new Map<string, Promise<CatalogItem>>();
 
-  const enriched = await runYoutubeSearchForItem(item, youtubeApiKey);
-  if (enriched.youtubeTrailerId) {
-    const existing = await db.mediaItems.get(item.id);
-    if (existing) {
-      const updatedItem = {
-        ...existing,
-        youtubeTrailerId: enriched.youtubeTrailerId,
-        youtubeEnriched: true,
-        updatedAt: Date.now(),
-      };
-      await db.mediaItems.put(updatedItem);
-      void syncCatalogItemsToServer([updatedItem]);
+/** Enriches a movie/series only when its details page is opened. */
+export async function fetchAndCacheDetailsOnDemand(
+  item: CatalogItem,
+  tmdbApiKey: string,
+  youtubeApiKey: string
+): Promise<CatalogItem> {
+  if (item.type === 'live' || item.type === 'radio') return item;
+  if (item.tmdbEnriched && item.youtubeEnriched) return item;
+
+  const inFlight = onDemandEnrichmentRequests.get(item.id);
+  if (inFlight) return inFlight;
+
+  const request = (async () => {
+    let enriched = item;
+    if (!enriched.tmdbEnriched) {
+      const tmdbResult = await runTmdbEnrichmentForItem(enriched, tmdbApiKey);
+      enriched = tmdbResult.item;
     }
-    return enriched.youtubeTrailerId;
-  }
-  return null;
+    if (!enriched.youtubeEnriched) {
+      enriched = await runYoutubeSearchForItem(enriched, youtubeApiKey);
+    }
+
+    const existing = await db.mediaItems.get(item.id);
+    const updatedItem = {
+      ...(existing || item),
+      ...enriched,
+      id: item.id,
+      sources: existing?.sources || item.sources,
+      episodes: existing?.episodes || item.episodes,
+      updatedAt: Date.now(),
+    };
+    await db.mediaItems.put(updatedItem);
+    await syncCatalogItemsToServer([updatedItem]);
+    return updatedItem;
+  })().finally(() => {
+    onDemandEnrichmentRequests.delete(item.id);
+  });
+
+  onDemandEnrichmentRequests.set(item.id, request);
+  return request;
 }
 
 export async function processItemFullPipeline(
@@ -557,25 +572,7 @@ export async function processItemFullPipeline(
     signal
   );
 
-  // Enrich both approved items (including series) and pendente items (e.g. CORS/Proxy/HTML blocked)
-  if (updated.status !== 'offline') {
-    throwIfAborted(signal);
-    onStage?.('tmdb');
-    const tmdbRes = await runTmdbEnrichmentForItem(
-      updated,
-      settings.tmdbApiKey,
-      signal
-    );
-    updated = tmdbRes.item;
-
-    throwIfAborted(signal);
-    onStage?.('youtube', tmdbRes.note);
-    updated = await runYoutubeSearchForItem(
-      updated,
-      settings.youtubeApiKey,
-      signal
-    );
-  }
+  // TMDB and YouTube are intentionally deferred until the details page opens.
 
   await db.mediaItems.put(updated);
   if (!options?.skipServerSync) {

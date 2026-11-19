@@ -41,7 +41,6 @@ import {
 import {
   runIndexedDbMigrationToServer,
   syncFavoritesToServer,
-  syncWorkPatchToServer,
 } from './services/persistenceSync';
 import {
   SaveWatchProgressPayload,
@@ -548,17 +547,16 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  const handleTrailerResolved = useCallback(
-    (itemId: string, trailerId: string) => {
+  const handleItemEnriched = useCallback(
+    (enriched: CatalogItem) => {
       setPublishedDbItems((prev) =>
         prev.map((item) =>
-          item.id === itemId ? { ...item, youtubeTrailerId: trailerId } : item
+          item.id === enriched.id ? enriched : item
         )
       );
-      void syncWorkPatchToServer(itemId, {
-        youtubeTrailerId: trailerId,
-        youtubeEnriched: true,
-      });
+      setModalItem((current) =>
+        current?.id === enriched.id ? enriched : current
+      );
     },
     []
   );
@@ -595,10 +593,8 @@ export default function App() {
                 onSelectIndex={setHeroIndex}
                 isMuted={isHeroMuted}
                 onToggleMute={() => setIsHeroMuted((m) => !m)}
-                youtubeApiKey={settings.youtubeApiKey}
                 onPlay={handleOpenPlayer}
                 onMoreInfo={setModalItem}
-                onTrailerResolved={handleTrailerResolved}
               />
 
               <div className="-mt-6 relative z-20 space-y-12">
@@ -811,6 +807,7 @@ export default function App() {
         item={modalItem}
         allCatalog={allSearchableCatalog}
         isInMyList={modalItem ? myListIds.includes(modalItem.id) : false}
+        tmdbApiKey={settings.tmdbApiKey}
         youtubeApiKey={settings.youtubeApiKey}
         watchHistory={watchHistory}
         continueEntry={
@@ -822,7 +819,7 @@ export default function App() {
         onPlay={handleOpenPlayer}
         onToggleMyList={handleToggleMyList}
         onSelectSimilar={(sim) => setModalItem(sim)}
-        onTrailerResolved={handleTrailerResolved}
+        onItemEnriched={handleItemEnriched}
       />
 
       <VideoPlayer

@@ -46,11 +46,13 @@ export interface MigrationExecutionResult {
   migratedHistory: number;
 }
 
-async function getBearerHeaders(): Promise<Record<string, string> | null> {
+async function getBearerHeaders(
+  forceRefresh = false
+): Promise<Record<string, string> | null> {
   const user = auth.currentUser;
   if (!user) return null;
   try {
-    const token = await user.getIdToken();
+    const token = await user.getIdToken(forceRefresh);
     if (!token) return null;
     return {
       'Content-Type': 'application/json',
@@ -59,6 +61,26 @@ async function getBearerHeaders(): Promise<Record<string, string> | null> {
   } catch {
     return null;
   }
+}
+
+async function fetchWithAuthRetry(
+  input: RequestInfo | URL,
+  init: RequestInit = {}
+): Promise<Response> {
+  const headers = await getBearerHeaders();
+  if (!headers) {
+    throw new Error('Autenticação necessária. Entre novamente e tente de novo.');
+  }
+  let response = await fetch(input, { ...init, headers: { ...headers, ...init.headers } });
+  if (response.status !== 401) return response;
+
+  const refreshedHeaders = await getBearerHeaders(true);
+  if (!refreshedHeaders) return response;
+  response = await fetch(input, {
+    ...init,
+    headers: { ...refreshedHeaders, ...init.headers },
+  });
+  return response;
 }
 
 export async function createLocalBackupSnapshot(): Promise<LocalBackupSnapshot> {
@@ -527,13 +549,8 @@ export async function startProcessingTask(params: {
   queued: boolean;
   empty?: boolean;
 }> {
-  const headers = await getBearerHeaders();
-  if (!headers) {
-    throw new Error('Autenticação necessária para iniciar processamento em segundo plano.');
-  }
-  const resp = await fetch('/api/tasks/processing', {
+  const resp = await fetchWithAuthRetry('/api/tasks/processing', {
     method: 'POST',
-    headers,
     body: JSON.stringify(params),
   });
   const data = (await resp.json().catch(() => ({}))) as {

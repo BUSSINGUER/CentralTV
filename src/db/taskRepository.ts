@@ -278,6 +278,34 @@ export async function getInternalTaskById(
   }
 }
 
+/**
+ * Reads only the mutable execution fields used by the runner's checkpoint loop.
+ * Do not use getInternalTaskById for this check: it deserializes the complete
+ * target ID snapshot, which can contain tens of thousands of IDs.
+ */
+export async function getProcessingTaskExecutionState(
+  taskId: string
+): Promise<Pick<ProcessingTaskView, 'status' | 'currentTitle'> | null> {
+  try {
+    const rows = await pgDb
+      .select({
+        status: processingTasks.status,
+        currentTitle: processingTasks.currentTitle,
+      })
+      .from(processingTasks)
+      .where(eq(processingTasks.id, taskId))
+      .limit(1);
+    if (!rows[0]) return null;
+    return {
+      status: rows[0].status as ProcessingTaskStatus,
+      currentTitle: rows[0].currentTitle,
+    };
+  } catch (error) {
+    console.error('Failed to load processing task execution state:', error);
+    throw new Error('Falha ao consultar estado da tarefa.', { cause: error });
+  }
+}
+
 export async function getInterruptedRunningTasks(): Promise<
   InternalProcessingTaskRecord[]
 > {

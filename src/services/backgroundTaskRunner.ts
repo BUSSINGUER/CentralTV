@@ -3,6 +3,7 @@ import {
   getHydratedWorkByIdFromPostgres,
   getInternalTaskById,
   getInterruptedRunningTasks,
+  getProcessingTaskExecutionState,
   saveProcessedWorkResultInPostgres,
   transitionProcessingTaskStatus,
   updateProcessingTaskProgressInPostgres,
@@ -267,6 +268,10 @@ export class BackgroundTaskRunner {
     let failedCount = record.view.failedCount || 0;
     let lastNote = record.view.lastNote;
 
+    console.info(
+      `[BackgroundTaskRunner] Starting ${taskId}: ${targetIds.length} items, cursor ${cursor}, concurrency ${batchSize}.`
+    );
+
     if (cursor >= targetIds.length) {
       await updateProcessingTaskProgressInPostgres(taskId, {
         status: 'completed',
@@ -283,8 +288,8 @@ export class BackgroundTaskRunner {
         }
 
         // Verify persistent status before each slice in case another caller paused/cancelled
-        const fresh = await getInternalTaskById(taskId);
-        if (!fresh || fresh.view.status !== 'running') {
+        const fresh = await getProcessingTaskExecutionState(taskId);
+        if (!fresh || fresh.status !== 'running') {
           break;
         }
 
@@ -408,7 +413,7 @@ export class BackgroundTaskRunner {
             pendingBlockedCount,
             offlineCount,
             failedCount,
-            currentTitle: lastTitleInSlice || fresh.view.currentTitle,
+            currentTitle: lastTitleInSlice || fresh.currentTitle,
             lastNote: lastNote ?? null,
           });
         }
@@ -433,6 +438,9 @@ export class BackgroundTaskRunner {
             lastNote: lastNote ?? null,
             finishedAt: Date.now(),
           });
+          console.info(
+            `[BackgroundTaskRunner] Completed ${taskId}: ${processedItems}/${targetIds.length} items.`
+          );
         }
       }
     } catch (fatalErr) {
@@ -470,31 +478,7 @@ export class BackgroundTaskRunner {
     let updated = await this.runHealthCheck(item, config.probeTimeoutMs, signal);
     let note: string | undefined = updated.lastError;
 
-    if (updated.status !== 'offline') {
-      if (signal.aborted) {
-        throw new DOMException('Aborted', 'AbortError');
-      }
-      onStage('tmdb', note);
-      const tmdbRes = await this.runTmdbEnrich(
-        updated,
-        config.tmdbApiKey,
-        signal
-      );
-      updated = tmdbRes.item;
-      if (tmdbRes.note) {
-        note = tmdbRes.note;
-      }
-
-      if (signal.aborted) {
-        throw new DOMException('Aborted', 'AbortError');
-      }
-      onStage('youtube', note);
-      updated = await this.runYoutubeEnrich(
-        updated,
-        config.youtubeApiKey,
-        signal
-      );
-    }
+    // Metadata and trailers are loaded lazily when a user opens the details page.
 
     return { item: updated, note };
   }

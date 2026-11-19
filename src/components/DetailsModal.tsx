@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Check, Film, Play, Plus, Star, Tv, X } from 'lucide-react';
 import { PLATFORM_LABELS } from '../data/catalog';
-import { fetchAndCacheTrailerOnDemand } from '../services/pipeline';
+import { fetchAndCacheDetailsOnDemand } from '../services/pipeline';
 import {
   findEpisodeHistoryRecord,
   getLatestItemHistory,
@@ -22,6 +22,7 @@ interface DetailsModalProps {
   item: CatalogItem | null;
   allCatalog: CatalogItem[];
   isInMyList: boolean;
+  tmdbApiKey?: string;
   youtubeApiKey?: string;
   watchHistory?: WatchHistoryRecord[];
   continueEntry?: ContinueWatchingEntry;
@@ -29,13 +30,14 @@ interface DetailsModalProps {
   onPlay: (item: CatalogItem, options?: PlaybackStartOptions) => void;
   onToggleMyList: (itemId: string) => void;
   onSelectSimilar: (item: CatalogItem) => void;
-  onTrailerResolved?: (itemId: string, trailerId: string) => void;
+  onItemEnriched?: (item: CatalogItem) => void;
 }
 
 export function DetailsModal({
   item,
   allCatalog: _allCatalog,
   isInMyList,
+  tmdbApiKey = '',
   youtubeApiKey = '',
   watchHistory = [],
   continueEntry,
@@ -43,7 +45,7 @@ export function DetailsModal({
   onPlay,
   onToggleMyList,
   onSelectSimilar: _onSelectSimilar,
-  onTrailerResolved,
+  onItemEnriched,
 }: DetailsModalProps) {
   const [resolvedTrailerId, setResolvedTrailerId] = useState(
     item?.youtubeTrailerId || ''
@@ -241,23 +243,30 @@ export function DetailsModal({
     setResolvedTrailerId(initialId);
     setShowTrailer(Boolean(initialId));
 
-    if (!item || initialId || item.type === 'live' || item.type === 'radio') {
+    if (
+      !item ||
+      (item.tmdbEnriched && item.youtubeEnriched) ||
+      item.type === 'live' ||
+      item.type === 'radio'
+    ) {
       return;
     }
 
     let cancelled = false;
-    void fetchAndCacheTrailerOnDemand(item, youtubeApiKey).then((foundId) => {
-      if (!cancelled && foundId) {
-        setResolvedTrailerId(foundId);
-        setShowTrailer(true);
-        onTrailerResolved?.(item.id, foundId);
+    void fetchAndCacheDetailsOnDemand(item, tmdbApiKey, youtubeApiKey).then((enriched) => {
+      if (!cancelled) {
+        if (enriched.youtubeTrailerId) {
+          setResolvedTrailerId(enriched.youtubeTrailerId);
+          setShowTrailer(true);
+        }
+        onItemEnriched?.(enriched);
       }
     });
 
     return () => {
       cancelled = true;
     };
-  }, [item?.id, item?.youtubeTrailerId, youtubeApiKey, onTrailerResolved]);
+  }, [item?.id, item?.tmdbEnriched, item?.youtubeEnriched, item?.youtubeTrailerId, tmdbApiKey, youtubeApiKey, onItemEnriched]);
 
   useEffect(() => {
     if (!item) return;

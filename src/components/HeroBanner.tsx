@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Info, Play, Volume2, VolumeX } from 'lucide-react';
 import { PLATFORM_LABELS } from '../data/catalog';
-import { fetchAndCacheTrailerOnDemand } from '../services/pipeline';
 import { CatalogItem } from '../types/streaming';
 import { MediaImage } from './MediaImage';
 
@@ -11,10 +10,8 @@ interface HeroBannerProps {
   onSelectIndex: (index: number) => void;
   isMuted: boolean;
   onToggleMute: () => void;
-  youtubeApiKey?: string;
   onPlay: (item: CatalogItem) => void;
   onMoreInfo: (item: CatalogItem) => void;
-  onTrailerResolved?: (itemId: string, trailerId: string) => void;
 }
 
 export function HeroBanner({
@@ -23,10 +20,8 @@ export function HeroBanner({
   onSelectIndex,
   isMuted,
   onToggleMute,
-  youtubeApiKey = '',
   onPlay,
   onMoreInfo,
-  onTrailerResolved,
 }: HeroBannerProps) {
   const current = items[activeIndex] ?? items[0];
   const [trailerReady, setTrailerReady] = useState(false);
@@ -40,26 +35,11 @@ export function HeroBanner({
     setResolvedTrailerId(initialId);
     setTrailerReady(false);
 
-    if (current && !initialId && current.type !== 'live' && current.type !== 'radio') {
-      let cancelled = false;
-      void fetchAndCacheTrailerOnDemand(current, youtubeApiKey).then(
-        (foundId) => {
-          if (!cancelled && foundId) {
-            setResolvedTrailerId(foundId);
-            onTrailerResolved?.(current.id, foundId);
-          }
-        }
-      );
-      return () => {
-        cancelled = true;
-      };
-    }
-
     const timer = window.setTimeout(() => {
       setTrailerReady(true);
     }, 1100);
     return () => window.clearTimeout(timer);
-  }, [current?.id, current?.youtubeTrailerId, youtubeApiKey, onTrailerResolved]);
+  }, [current?.id, current?.youtubeTrailerId]);
 
   useEffect(() => {
     if (!resolvedTrailerId) return;
