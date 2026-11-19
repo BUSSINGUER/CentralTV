@@ -19,7 +19,7 @@ import {
   getCandidateProvisionalKeys,
   sortAndRelabelSourcesList,
 } from '../utils/identity.ts';
-import { pgDb } from './index.ts';
+import { pgDb, executeWithDbRetry } from './index.ts';
 import {
   episodes,
   lists,
@@ -1087,25 +1087,27 @@ export async function syncCatalogBatchToPostgres(params: {
   let reactivatedCount = 0;
 
   try {
-    await pgDb.transaction(async (tx) => {
-      if (params.list) {
-        await upsertListRecordToPostgres(tx, params.list, now);
-      }
-
-      for (const item of params.items) {
-        const res = await upsertWorkInsideTx(tx, item, {
-          mergeWithoutOverwrite: Boolean(params.mergeWithoutOverwrite),
-          preserveAvailability: Boolean(params.mergeWithoutOverwrite),
-          now,
-        });
-        if (item.id) {
-          idMap[item.id] = res.workId;
+    await executeWithDbRetry(() =>
+      pgDb.transaction(async (tx) => {
+        if (params.list) {
+          await upsertListRecordToPostgres(tx, params.list, now);
         }
-        if (res.created) createdCount += 1;
-        else mergedCount += 1;
-        if (res.reactivated) reactivatedCount += 1;
-      }
-    });
+
+        for (const item of params.items) {
+          const res = await upsertWorkInsideTx(tx, item, {
+            mergeWithoutOverwrite: Boolean(params.mergeWithoutOverwrite),
+            preserveAvailability: Boolean(params.mergeWithoutOverwrite),
+            now,
+          });
+          if (item.id) {
+            idMap[item.id] = res.workId;
+          }
+          if (res.created) createdCount += 1;
+          else mergedCount += 1;
+          if (res.reactivated) reactivatedCount += 1;
+        }
+      })
+    );
 
     return { idMap, createdCount, mergedCount, reactivatedCount };
   } catch (error) {
@@ -1131,7 +1133,8 @@ export async function deleteListDecoupledFromPostgres(listId: string): Promise<{
   const now = Date.now();
 
   try {
-    return await pgDb.transaction(async (tx) => {
+    return await executeWithDbRetry(() =>
+      pgDb.transaction(async (tx) => {
       const listSources = await tx
         .select({
           id: sources.id,
@@ -1200,7 +1203,8 @@ export async function deleteListDecoupledFromPostgres(listId: string): Promise<{
         archivedWorks,
         archivedWorkIds,
       };
-    });
+    })
+  );
   } catch (error) {
     console.error('Failed to delete list in decoupled mode:', error);
     throw new Error('Falha ao excluir lista sem perder fichas do acervo.', {
