@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, DragEvent, FormEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, useCallback, DragEvent, FormEvent } from 'react';
 import {
   AlertTriangle,
   ArrowLeft,
@@ -49,6 +49,19 @@ import {
   SAMPLE_M3U_SNIPPET,
   unifyAndReclassifyCatalog,
 } from '../services/m3uParser';
+import { useAuth } from '../contexts/AuthContext';
+import { auth } from '../lib/firebase';
+import { ServerRecord } from '../db/catalogRepository';
+import {
+  deleteWorkOnServer,
+  fetchMigrationBackups,
+  restoreLocalBackupSnapshot,
+  rollbackServerMigration,
+  runIndexedDbMigrationToServer,
+  ServerMigrationBackupItem,
+  syncCatalogItemsToServer,
+  syncWorkPatchToServer,
+} from '../services/persistenceSync';
 import {
   PipelineProgress,
   processItemFullPipeline,
@@ -74,7 +87,7 @@ interface AdminPanelProps {
   onEpgChanged?: () => void;
 }
 
-export type AdminTab = 'queue' | 'import' | 'lists' | 'settings';
+export type AdminTab = 'queue' | 'import' | 'lists' | 'servers' | 'settings';
 
 const STATUS_LABELS: Record<PublishStatus, string> = {
   pendente: 'Pendente',
@@ -101,17 +114,174 @@ export function AdminPanel({
   onCatalogChanged,
   onEpgChanged,
 }: AdminPanelProps) {
+  const { user } = useAuth();
   const [activeTab, setActiveTab] = useState<AdminTab>(initialTab);
   const [items, setItems] = useState<CatalogItem[]>([]);
+  const [archivedCount, setArchivedCount] = useState(0);
   const [m3uLists, setM3uLists] = useState<M3uListRecord[]>([]);
   const [loadingDb, setLoadingDb] = useState(true);
   const [epgCount, setEpgCount] = useState(0);
+  const [migrationBackups, setMigrationBackups] = useState<
+    ServerMigrationBackupItem[]
+  >([]);
+  const [migrationBusy, setMigrationBusy] = useState(false);
+  const [migrationMsg, setMigrationMsg] = useState<string | null>(null);
 
-  // Filters & Pagination
-  const [statusFilter, setStatusFilter] = useState<'all' | PublishStatus>('all');
-  const [kindFilter, setKindFilter] = useState<'all' | MediaKind>('all');
+  // Filter & Pagination state
+  const [statusFilter, setStatusFilter] = useState<PublishStatus | 'all'>('all');
+  const [kindFilter, setKindFilter] = useState<MediaKind | 'all'>('all');
   const [searchTerm, setSearchTerm] = useState('');
   const [page, setPage] = useState(1);
+
+  // Content Servers state
+  const [servers, setServers] = useState<ServerRecord[]>([]);
+  const [loadingServers, setLoadingServers] = useState(false);
+  const [serverModalOpen, setServerModalOpen] = useState(false);
+  const [editingServer, setEditingServer] = useState<ServerRecord | null>(null);
+  const [serverForm, setServerForm] = useState({
+    name: '',
+    baseUrl: '',
+    serverType: 'm3u' as ServerRecord['serverType'],
+    username: '',
+    password: '',
+  });
+  const [serverActionMsg, setServerActionMsg] = useState<string | null>(null);
+  const [testingServerId, setTestingServerId] = useState<string | null>(null);
+  const [syncingServerId, setSyncingServerId] = useState<string | null>(null);
+
+  const getAuthHeaders = async (): Promise<Record<string, string>> => {
+    const u = auth.currentUser;
+    if (!u) return {};
+    const token = await u.getIdToken();
+    return {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    };
+  };
+
+  const loadServers = useCallback(async () => {
+    setLoadingServers(true);
+    try {
+      const headers = await getAuthHeaders();
+      const resp = await fetch('/api/servers', { headers });
+      if (resp.ok) {
+        const data = await resp.json();
+        setServers(data.servers || []);
+      }
+    } catch {
+      // ignore
+    } finally {
+      setLoadingServers(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === 'servers') {
+      void loadServers();
+    }
+  }, [activeTab, loadServers]);
+
+  const handleSaveServer = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!serverForm.name.trim() || !serverForm.baseUrl.trim()) {
+      setServerActionMsg('Nome e URL base são obrigatórios.');
+      return;
+    }
+    setServerActionMsg('Salvando servidor...');
+    try {
+      const headers = await getAuthHeaders();
+      const resp = await fetch('/api/servers', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          id: editingServer?.id,
+          name: serverForm.name.trim(),
+          baseUrl: serverForm.baseUrl.trim(),
+          serverType: serverForm.serverType,
+          username: serverForm.username.trim() || undefined,
+          password: serverForm.password.trim() || undefined,
+        }),
+      });
+      if (resp.ok) {
+        setServerModalOpen(false);
+        setEditingServer(null);
+        setServerForm({ name: '', baseUrl: '', serverType: 'm3u', username: '', password: '' });
+        setServerActionMsg('Servidor salvo com sucesso.');
+        void loadServers();
+      } else {
+        const err = await resp.json().catch(() => ({}));
+        setServerActionMsg(err.error || 'Falha ao salvar servidor.');
+      }
+    } catch (err) {
+      setServerActionMsg(err instanceof Error ? err.message : 'Erro ao salvar servidor.');
+    }
+  };
+
+  const handleTestServer = async (serverId: string) => {
+    setTestingServerId(serverId);
+    setServerActionMsg('Testando conexão com o servidor...');
+    try {
+      const headers = await getAuthHeaders();
+      const resp = await fetch(`/api/servers/${encodeURIComponent(serverId)}/test`, {
+        method: 'POST',
+        headers,
+      });
+      const data = await resp.json();
+      if (resp.ok && data.ok) {
+        setServerActionMsg(`Teste concluído: ${data.reason} (${data.latencyMs}ms).`);
+      } else {
+        setServerActionMsg(`Falha no teste: ${data.reason || 'Servidor inacessível'}.`);
+      }
+      void loadServers();
+    } catch (err) {
+      setServerActionMsg(err instanceof Error ? err.message : 'Erro ao testar servidor.');
+    } finally {
+      setTestingServerId(null);
+    }
+  };
+
+  const handleSyncServer = async (serverId: string) => {
+    setSyncingServerId(serverId);
+    setServerActionMsg('Sincronizando conteúdo do servidor...');
+    try {
+      const headers = await getAuthHeaders();
+      const resp = await fetch(`/api/servers/${encodeURIComponent(serverId)}/sync`, {
+        method: 'POST',
+        headers,
+      });
+      const data = await resp.json();
+      if (resp.ok && data.ok) {
+        setServerActionMsg(`Sincronização concluída com sucesso (${data.itemCount} itens processados).`);
+        void loadServers();
+        onCatalogChanged();
+      } else {
+        setServerActionMsg(`Falha na sincronização: ${data.error || 'Erro desconhecido'}.`);
+      }
+    } catch (err) {
+      setServerActionMsg(err instanceof Error ? err.message : 'Erro na sincronização.');
+    } finally {
+      setSyncingServerId(null);
+    }
+  };
+
+  const handleDeleteServer = async (serverId: string) => {
+    if (!window.confirm('Tem certeza que deseja remover este servidor?')) return;
+    try {
+      const headers = await getAuthHeaders();
+      const resp = await fetch(`/api/servers/${encodeURIComponent(serverId)}`, {
+        method: 'DELETE',
+        headers,
+      });
+      if (resp.ok) {
+        setServerActionMsg('Servidor removido.');
+        void loadServers();
+      } else {
+        setServerActionMsg('Falha ao remover servidor.');
+      }
+    } catch {
+      setServerActionMsg('Erro ao remover servidor.');
+    }
+  };
 
   // Import state
   const [importSourceMode, setImportSourceMode] = useState<
@@ -180,21 +350,24 @@ export function AdminPanel({
   const [settingsSavedMsg, setSettingsSavedMsg] = useState(false);
 
   const refreshItems = async () => {
-    const [all, epg, lists] = await Promise.all([
+    const [all, epg, lists, backups] = await Promise.all([
       db.mediaItems.orderBy('createdAt').reverse().toArray(),
       getAllEpgPrograms(),
       getAllM3uLists(),
+      user ? fetchMigrationBackups() : Promise.resolve([]),
     ]);
-    setItems(all);
+    setItems(all.filter((it) => !it.archived));
+    setArchivedCount(all.filter((it) => Boolean(it.archived)).length);
     setEpgCount(epg.length);
     setM3uLists(lists);
+    setMigrationBackups(backups);
     setLoadingDb(false);
     onCatalogChanged();
   };
 
   useEffect(() => {
     void refreshItems();
-  }, []);
+  }, [user]);
 
   useEffect(() => {
     setActiveTab(initialTab);
@@ -625,13 +798,13 @@ export function AdminPanel({
     const approvedItems = items.filter((i) => i.status === 'aprovado');
     if (approvedItems.length === 0) return;
     const now = Date.now();
-    await db.mediaItems.bulkPut(
-      approvedItems.map((item) => ({
-        ...item,
-        status: 'publicado' as PublishStatus,
-        updatedAt: now,
-      }))
-    );
+    const publishedBatch = approvedItems.map((item) => ({
+      ...item,
+      status: 'publicado' as PublishStatus,
+      updatedAt: now,
+    }));
+    await db.mediaItems.bulkPut(publishedBatch);
+    void syncCatalogItemsToServer(publishedBatch);
     await refreshItems();
   };
 
@@ -643,6 +816,7 @@ export function AdminPanel({
       status: nextStatus,
       updatedAt: Date.now(),
     });
+    void syncWorkPatchToServer(item.id, { status: nextStatus });
     await refreshItems();
   };
 
@@ -655,11 +829,13 @@ export function AdminPanel({
       platform,
       updatedAt: Date.now(),
     });
+    void syncWorkPatchToServer(item.id, { platform });
     await refreshItems();
   };
 
   const handleDeleteItem = async (id: string) => {
     await db.mediaItems.delete(id);
+    void deleteWorkOnServer(id);
     await refreshItems();
   };
 
@@ -669,12 +845,15 @@ export function AdminPanel({
       .map((i) => i.id);
     if (offlineIds.length === 0) return;
     await db.mediaItems.bulkDelete(offlineIds);
+    for (const id of offlineIds) {
+      void deleteWorkOnServer(id);
+    }
     await refreshItems();
   };
 
   const handleClearAllDb = async () => {
     await Promise.all([db.mediaItems.clear(), db.m3u_lists.clear()]);
-    setReclassifyMsg('Catálogo e listas M3U limpos no IndexedDB.');
+    setReclassifyMsg('Cache local e listas limpos no dispositivo.');
     setImportResultMsg(null);
     await refreshItems();
   };
@@ -687,10 +866,66 @@ export function AdminPanel({
       setConfirmDeleteListId(null);
       await refreshItems();
       setListActionMsg(
-        `Lista "${list.name}" excluída: ${res.removedSources} fontes removidas, ${res.updatedItems} títulos preservados com outras listas e ${res.removedItems} títulos sem fontes restantes removidos do catálogo.`
+        `Lista "${list.name}" excluída: ${res.removedSources} fontes removidas, ${res.updatedItems} títulos mantidos com outras listas e ${res.archivedItems} fichas arquivadas (metadados, favoritos e histórico preservados até reimportação).`
       );
     } finally {
       setDeletingListId(null);
+    }
+  };
+
+  const handleRunManualMigration = async () => {
+    setMigrationBusy(true);
+    setMigrationMsg(null);
+    try {
+      const summary = await runIndexedDbMigrationToServer('manual_admin');
+      await refreshItems();
+      if (summary) {
+        setMigrationMsg(
+          `Backup ${summary.backupId} criado e acervo sincronizado: ${summary.createdWorks} novos títulos, ${summary.mergedWorks} mesclados sem sobrescrita, ${summary.createdFavorites} favoritos e ${summary.migratedHistory} registros de progresso.`
+        );
+      } else {
+        setMigrationMsg('Faça login com Google para sincronizar o backup na nuvem.');
+      }
+    } catch (err) {
+      setMigrationMsg(
+        err instanceof Error ? err.message : 'Falha na sincronização do acervo.'
+      );
+    } finally {
+      setMigrationBusy(false);
+    }
+  };
+
+  const handleRestoreLocalSnapshot = async () => {
+    setMigrationBusy(true);
+    setMigrationMsg(null);
+    try {
+      const ok = await restoreLocalBackupSnapshot();
+      await refreshItems();
+      setMigrationMsg(
+        ok
+          ? 'Snapshot local restaurado no cache do dispositivo.'
+          : 'Nenhum snapshot local encontrado ainda.'
+      );
+    } finally {
+      setMigrationBusy(false);
+    }
+  };
+
+  const handleRollbackServerBackup = async (backupId: string) => {
+    setMigrationBusy(true);
+    setMigrationMsg(null);
+    try {
+      const res = await rollbackServerMigration(backupId);
+      await refreshItems();
+      setMigrationMsg(
+        `Rollback concluído (${res.backupId}): ${res.revertedWorks} títulos, ${res.revertedLists} listas, ${res.revertedSources} fontes, ${res.revertedFavorites} favoritos e ${res.revertedHistory} históricos revertidos.`
+      );
+    } catch (err) {
+      setMigrationMsg(
+        err instanceof Error ? err.message : 'Falha ao executar rollback.'
+      );
+    } finally {
+      setMigrationBusy(false);
     }
   };
 
@@ -1191,6 +1426,21 @@ export function AdminPanel({
 
         <button
           type="button"
+          onClick={() => {
+            setActiveTab('servers');
+          }}
+          className={`inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold transition-colors ${
+            activeTab === 'servers'
+              ? 'bg-white text-[#0B0C0E]'
+              : 'bg-[#121417] text-white/75 hover:bg-white/10 hover:text-white'
+          }`}
+        >
+          <Server className="h-4 w-4" />
+          Servidores ({servers.length})
+        </button>
+
+        <button
+          type="button"
           onClick={() => setActiveTab('settings')}
           className={`inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold transition-colors ${
             activeTab === 'settings'
@@ -1511,6 +1761,20 @@ export function AdminPanel({
                       const onlineCount = sources.filter(
                         (s) => s.status === 'online'
                       ).length;
+                      const confirmedCount = sources.filter(
+                        (s) => s.validationState === 'playback_confirmed'
+                      ).length;
+                      const blockedCount = sources.filter(
+                        (s) =>
+                          s.validationState === 'cors_blocked' ||
+                          s.validationState === 'proxy_blocked'
+                      ).length;
+                      const htmlCount = sources.filter(
+                        (s) => s.validationState === 'html_challenge'
+                      ).length;
+                      const offlineCount = sources.filter(
+                        (s) => s.status === 'offline'
+                      ).length;
 
                       return (
                         <tr
@@ -1590,9 +1854,37 @@ export function AdminPanel({
                                 {sources.map((s) => s.qualityTag || s.label).join(', ')}
                               </span>
                             )}
-                            {item.healthChecked && (
-                              <span className="block text-[11px] text-emerald-400/80">
-                                {onlineCount} online
+                            {(item.healthChecked ||
+                              confirmedCount > 0 ||
+                              blockedCount > 0 ||
+                              htmlCount > 0) && (
+                              <span className="block text-[11px] space-x-1.5">
+                                {confirmedCount > 0 ? (
+                                  <span className="text-emerald-400">
+                                    {confirmedCount} confirmada{confirmedCount > 1 ? 's' : ''}
+                                  </span>
+                                ) : onlineCount > 0 ? (
+                                  <span className="text-emerald-400/80">
+                                    {onlineCount} online
+                                  </span>
+                                ) : null}
+                                {blockedCount > 0 && (
+                                  <span className="text-amber-300">
+                                    {blockedCount} CORS/Proxy
+                                  </span>
+                                )}
+                                {htmlCount > 0 && (
+                                  <span className="text-sky-300">
+                                    {htmlCount} HTML
+                                  </span>
+                                )}
+                                {offlineCount > 0 &&
+                                  onlineCount === 0 &&
+                                  blockedCount === 0 && (
+                                    <span className="text-rose-400/85">
+                                      {offlineCount} offline
+                                    </span>
+                                  )}
                               </span>
                             )}
                           </td>
@@ -1813,8 +2105,11 @@ export function AdminPanel({
               <p className="mt-1 text-xs text-white/60">
                 Adicione novas fontes por arquivo local, URL direta (M3U ou
                 JSON) ou credenciais Xtream Codes. Excluir uma lista remove
-                apenas os links dela e preserva títulos presentes em outras
-                listas.
+                apenas os links dela e arquiva fichas sem fontes restantes,
+                preservando metadados, favoritos e histórico
+                {archivedCount > 0
+                  ? ` (${archivedCount} fichas arquivadas no acervo).`
+                  : '.'}
               </p>
             </div>
 
@@ -2047,216 +2342,559 @@ export function AdminPanel({
         </div>
       )}
 
+      {/* TAB: CONTENT SERVERS */}
+      {activeTab === 'servers' && (
+        <div className="space-y-6">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <h2 className="font-display text-xl font-bold text-white">
+                Servidores de Conteúdo & Provedores IPTV/VOD
+              </h2>
+              <p className="mt-1 text-xs text-white/60">
+                Cadastre e gerencie servidores autorizados (M3U, Xtream Codes API, JSON e Saimo base format). As credenciais são armazenadas de forma segura no backend.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setEditingServer(null);
+                setServerForm({ name: '', baseUrl: '', serverType: 'm3u', username: '', password: '' });
+                setServerModalOpen(true);
+              }}
+              className="inline-flex items-center gap-2 rounded-xl bg-white px-4 py-2 text-xs font-semibold text-[#0B0C0E] hover:bg-white/90"
+            >
+              <Plus className="h-4 w-4" />
+              Adicionar Servidor
+            </button>
+          </div>
+
+          {serverActionMsg && (
+            <div className="rounded-xl border border-white/15 bg-[#121417] p-4 text-xs text-white/80">
+              {serverActionMsg}
+            </div>
+          )}
+
+          {loadingServers ? (
+            <div className="py-12 text-center text-xs text-white/50">Carregando servidores...</div>
+          ) : servers.length === 0 ? (
+            <div className="rounded-xl border border-white/10 bg-[#121417] p-8 text-center">
+              <Server className="mx-auto h-8 w-8 text-white/30" />
+              <p className="mt-3 text-sm font-semibold text-white">Nenhum servidor cadastrado</p>
+              <p className="mt-1 text-xs text-white/50">Adicione seu primeiro servidor Xtream ou M3U para começar.</p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {servers.map((srv) => {
+                const isTesting = testingServerId === srv.id;
+                const isSyncing = syncingServerId === srv.id;
+                return (
+                  <div
+                    key={srv.id}
+                    className="flex flex-col gap-4 rounded-xl border border-white/10 bg-[#121417] p-5 sm:flex-row sm:items-center sm:justify-between"
+                  >
+                    <div className="space-y-1">
+                      <div className="flex items-center gap-2.5">
+                        <span className="font-display font-bold text-white text-base">{srv.name}</span>
+                        <span className="rounded bg-white/10 px-2 py-0.5 text-[10px] font-semibold text-white/80 uppercase">
+                          {srv.serverType}
+                        </span>
+                        <span
+                          className={`rounded px-2 py-0.5 text-[10px] font-semibold ${
+                            srv.lastSyncStatus === 'nominal'
+                              ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
+                              : srv.lastSyncStatus === 'error'
+                              ? 'bg-rose-500/15 text-rose-300 border border-rose-500/30'
+                              : 'bg-white/10 text-white/60'
+                          }`}
+                        >
+                          {srv.lastSyncStatus === 'nominal' ? 'Operacional' : srv.lastSyncStatus === 'error' ? 'Erro' : srv.lastSyncStatus === 'syncing' ? 'Sincronizando...' : 'Não Testado'}
+                        </span>
+                      </div>
+                      <p className="text-xs text-white/55 truncate max-w-xl">{srv.baseUrl}</p>
+                      <div className="flex flex-wrap items-center gap-4 text-xs text-white/45 pt-1">
+                        <span>Itens: <strong className="text-white/80 tabular-nums">{srv.itemCount}</strong></span>
+                        <span aria-hidden="true">·</span>
+                        <span>Última Sincronização: <strong className="text-white/85">{srv.lastSyncAt ? new Date(srv.lastSyncAt).toLocaleString('pt-BR') : 'Nunca'}</strong></span>
+                        {srv.syncReason && (
+                          <>
+                            <span aria-hidden="true">·</span>
+                            <span className="text-rose-300">{srv.syncReason}</span>
+                          </>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        disabled={isTesting}
+                        onClick={() => handleTestServer(srv.id)}
+                        className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-white/15 bg-white/5 px-3.5 text-xs font-semibold text-white hover:bg-white/10 disabled:opacity-50"
+                      >
+                        <RefreshCw className={`h-3.5 w-3.5 ${isTesting ? 'animate-spin' : ''}`} />
+                        {isTesting ? 'Testando...' : 'Testar'}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={isSyncing}
+                        onClick={() => handleSyncServer(srv.id)}
+                        className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-white px-3.5 text-xs font-semibold text-[#0B0C0E] hover:bg-white/90 disabled:opacity-50"
+                      >
+                        <WifiOff className={`h-3.5 w-3.5 ${isSyncing ? 'animate-spin' : ''}`} />
+                        {isSyncing ? 'Sincronizando...' : 'Sincronizar'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingServer(srv);
+                          setServerForm({
+                            name: srv.name,
+                            baseUrl: srv.baseUrl,
+                            serverType: srv.serverType,
+                            username: srv.username || '',
+                            password: srv.password || '',
+                          });
+                          setServerModalOpen(true);
+                        }}
+                        className="inline-flex h-9 items-center rounded-lg border border-white/15 bg-white/5 px-3 text-xs font-semibold text-white hover:bg-white/10"
+                      >
+                        Editar
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteServer(srv.id)}
+                        className="inline-flex h-9 items-center rounded-lg border border-rose-500/35 bg-rose-500/10 px-3 text-xs font-semibold text-rose-200 hover:bg-rose-500/20"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Add / Edit Server Modal */}
+          {serverModalOpen && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm">
+              <form
+                onSubmit={handleSaveServer}
+                className="w-full max-w-lg rounded-2xl border border-white/15 bg-[#121417] p-6 space-y-5 shadow-2xl"
+              >
+                <div>
+                  <h3 className="font-display text-lg font-bold text-white">
+                    {editingServer ? 'Editar Servidor de Conteúdo' : 'Cadastrar Servidor de Conteúdo'}
+                  </h3>
+                  <p className="mt-1 text-xs text-white/60">
+                    Insira as informações de conexão do provedor IPTV/VOD.
+                  </p>
+                </div>
+
+                <div className="space-y-4">
+                  <div>
+                    <label className="block text-xs font-semibold text-white/80 mb-1.5">
+                      Nome do Servidor
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      value={serverForm.name}
+                      onChange={(e) => setServerForm({ ...serverForm, name: e.target.value })}
+                      placeholder="Ex: Provedor Top IPTV"
+                      className="w-full rounded-xl border border-white/15 bg-[#0B0C0E] px-4 py-2.5 text-sm text-white focus:border-white focus:outline-none"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-white/80 mb-1.5">
+                      Tipo de Servidor / Formato
+                    </label>
+                    <select
+                      value={serverForm.serverType}
+                      onChange={(e) => setServerForm({ ...serverForm, serverType: e.target.value as any })}
+                      className="w-full rounded-xl border border-white/15 bg-[#0B0C0E] px-4 py-2.5 text-sm text-white focus:border-white focus:outline-none"
+                    >
+                      <option value="m3u">Lista M3U (URL / Stream)</option>
+                      <option value="xtream">Xtream Codes API</option>
+                      <option value="json">Catálogo JSON</option>
+                      <option value="saimo">Formato Saimo (indice.txt / bases)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-white/80 mb-1.5">
+                      URL Base do Servidor (ou URL M3U)
+                    </label>
+                    <input
+                      type="url"
+                      required
+                      value={serverForm.baseUrl}
+                      onChange={(e) => setServerForm({ ...serverForm, baseUrl: e.target.value })}
+                      placeholder="https://servidor.com:8080"
+                      className="w-full rounded-xl border border-white/15 bg-[#0B0C0E] px-4 py-2.5 text-sm text-white focus:border-white focus:outline-none"
+                    />
+                  </div>
+
+                  {serverForm.serverType === 'xtream' && (
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-xs font-semibold text-white/80 mb-1.5">Usuário</label>
+                        <input
+                          type="text"
+                          value={serverForm.username}
+                          onChange={(e) => setServerForm({ ...serverForm, username: e.target.value })}
+                          className="w-full rounded-xl border border-white/15 bg-[#0B0C0E] px-4 py-2.5 text-sm text-white focus:border-white focus:outline-none"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-semibold text-white/80 mb-1.5">Senha</label>
+                        <input
+                          type="password"
+                          value={serverForm.password}
+                          onChange={(e) => setServerForm({ ...serverForm, password: e.target.value })}
+                          className="w-full rounded-xl border border-white/15 bg-[#0B0C0E] px-4 py-2.5 text-sm text-white focus:border-white focus:outline-none"
+                        />
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex items-center justify-end gap-3 pt-2 border-t border-white/10">
+                  <button
+                    type="button"
+                    onClick={() => setServerModalOpen(false)}
+                    className="rounded-xl border border-white/15 bg-transparent px-4 py-2.5 text-xs font-semibold text-white hover:bg-white/10"
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    type="submit"
+                    className="rounded-xl bg-white px-5 py-2.5 text-xs font-semibold text-[#0B0C0E] hover:bg-white/90"
+                  >
+                    Salvar Servidor
+                  </button>
+                </div>
+              </form>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* TAB 4: API & PROXY SETTINGS */}
       {activeTab === 'settings' && (
-        <form
-          onSubmit={handleSaveSettings}
-          className="max-w-2xl rounded-xl border border-white/10 bg-[#121417] p-6 space-y-5"
-        >
-          <div>
-            <h2 className="font-display text-lg font-bold text-white">
-              Configurações de API, Proxy HTTP→HTTPS & Lotes
-            </h2>
-            <p className="mt-1 text-xs text-white/60">
-              As chaves de API são protegidas por cadeado e salvas no{' '}
-              <code>localStorage</code> e no IndexedDB.
-            </p>
-          </div>
-
-          <div className="space-y-1.5">
-            <label className="block text-xs font-semibold text-white/80">
-              TMDB API Key (v3 API Key ou Token Bearer v4)
-            </label>
-            <div className="flex items-center gap-2">
-              <input
-                type={tmdbLocked ? 'password' : 'text'}
-                value={tmdbLocked ? '••••••••••••' : tmdbKey}
-                readOnly={tmdbLocked}
-                disabled={tmdbLocked}
-                onChange={(e) => setTmdbKey(e.target.value)}
-                placeholder="Cole sua chave TMDB para sinopse, elenco, nota e Watch Providers BR"
-                className={`flex-1 rounded-lg border border-white/15 px-3.5 py-2.5 text-sm text-white placeholder:text-white/35 focus:border-white/40 focus:outline-none ${
-                  tmdbLocked
-                    ? 'cursor-not-allowed bg-[#0B0C0E]/60 text-white/55'
-                    : 'bg-[#0B0C0E]'
-                }`}
-              />
-              <button
-                type="button"
-                onClick={() => setTmdbLocked((locked) => !locked)}
-                aria-label={
-                  tmdbLocked
-                    ? 'Desbloquear campo TMDB API Key'
-                    : 'Bloquear campo TMDB API Key'
-                }
-                title={
-                  tmdbLocked
-                    ? 'Desbloquear para visualizar/editar'
-                    : 'Bloquear campo'
-                }
-                className={`inline-flex h-[42px] items-center gap-1.5 rounded-lg border px-3.5 text-xs font-semibold transition-colors ${
-                  tmdbLocked
-                    ? 'border-white/15 bg-[#181B20] text-white/80 hover:bg-white/10'
-                    : 'border-amber-400/50 bg-amber-400/15 text-amber-200 hover:bg-amber-400/25'
-                }`}
-              >
-                {tmdbLocked ? (
-                  <>
-                    <Lock className="h-4 w-4" />
-                    <span className="hidden sm:inline">Desbloquear</span>
-                  </>
-                ) : (
-                  <>
-                    <Unlock className="h-4 w-4" />
-                    <span className="hidden sm:inline">Bloquear</span>
-                  </>
-                )}
-              </button>
-            </div>
-            <p className="text-[11px] text-white/45">
-              {tmdbKey
-                ? 'Chave TMDB carregada no navegador.'
-                : 'Nenhuma chave local informada — clique no cadeado para inserir.'}
-            </p>
-          </div>
-
-          <div className="space-y-1.5">
-            <label className="block text-xs font-semibold text-white/80">
-              YouTube Data API v3 Key
-            </label>
-            <div className="flex items-center gap-2">
-              <input
-                type={youtubeLocked ? 'password' : 'text'}
-                value={youtubeLocked ? '••••••••••••' : youtubeKey}
-                readOnly={youtubeLocked}
-                disabled={youtubeLocked}
-                onChange={(e) => setYoutubeKey(e.target.value)}
-                placeholder="Cole sua chave YouTube Data API v3 (ou deixe vazio para busca automática)"
-                className={`flex-1 rounded-lg border border-white/15 px-3.5 py-2.5 text-sm text-white placeholder:text-white/35 focus:border-white/40 focus:outline-none ${
-                  youtubeLocked
-                    ? 'cursor-not-allowed bg-[#0B0C0E]/60 text-white/55'
-                    : 'bg-[#0B0C0E]'
-                }`}
-              />
-              <button
-                type="button"
-                onClick={() => setYoutubeLocked((locked) => !locked)}
-                aria-label={
-                  youtubeLocked
-                    ? 'Desbloquear campo YouTube API Key'
-                    : 'Bloquear campo YouTube API Key'
-                }
-                title={
-                  youtubeLocked
-                    ? 'Desbloquear para visualizar/editar'
-                    : 'Bloquear campo'
-                }
-                className={`inline-flex h-[42px] items-center gap-1.5 rounded-lg border px-3.5 text-xs font-semibold transition-colors ${
-                  youtubeLocked
-                    ? 'border-white/15 bg-[#181B20] text-white/80 hover:bg-white/10'
-                    : 'border-amber-400/50 bg-amber-400/15 text-amber-200 hover:bg-amber-400/25'
-                }`}
-              >
-                {youtubeLocked ? (
-                  <>
-                    <Lock className="h-4 w-4" />
-                    <span className="hidden sm:inline">Desbloquear</span>
-                  </>
-                ) : (
-                  <>
-                    <Unlock className="h-4 w-4" />
-                    <span className="hidden sm:inline">Bloquear</span>
-                  </>
-                )}
-              </button>
-            </div>
-            <p className="text-[11px] text-white/45">
-              {youtubeKey
-                ? 'Chave YouTube carregada no navegador.'
-                : 'Nenhuma chave local informada — clique no cadeado para inserir.'}
-            </p>
-          </div>
-
-          <div className="space-y-1.5">
-            <label className="block text-xs font-semibold text-white/80">
-              Prefixo de Proxy CORS / Stream (Opcional — padrão automático: /api/stream?url=)
-            </label>
-            <input
-              type="text"
-              value={streamProxyPrefix}
-              onChange={(e) => setStreamProxyPrefix(e.target.value)}
-              placeholder="Vazio usa automaticamente /api/stream?url= para links http:// em https://"
-              className="w-full rounded-lg border border-white/15 bg-[#0B0C0E] px-3.5 py-2.5 text-sm text-white placeholder:text-white/35 focus:border-white/40 focus:outline-none"
-            />
-          </div>
-
-          <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-white/10 bg-[#0B0C0E]/70 p-4 transition-colors hover:border-white/25">
-            <input
-              type="checkbox"
-              checked={autoProxyHttpStreams}
-              onChange={(e) => setAutoProxyHttpStreams(e.target.checked)}
-              className="mt-0.5 h-4 w-4 rounded border-white/25 bg-[#121417] accent-[#E50914]"
-            />
-            <div className="space-y-1">
-              <span className="block text-xs font-bold text-white">
-                Modo Proxy Automático (ativado por padrão para links http://)
-              </span>
-              <span className="block text-[11px] leading-relaxed text-white/60">
-                Roteia automaticamente links <code>http://</code> (incluindo{' '}
-                <code>.m3u8</code>, segmentos <code>.ts</code> e mídias em
-                páginas HTTPS) pelo Proxy de servidor com cabeçalhos CORS,
-                preservando arquivos <code>https://</code> diretos no elemento{' '}
-                <code>&lt;video&gt;</code> nativo sem{' '}
-                <code>crossOrigin</code>.
-              </span>
-            </div>
-          </label>
-
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div className="space-y-1.5">
-              <label className="block text-xs font-semibold text-white/80">
-                Tamanho do Lote (itens simultâneos)
-              </label>
-              <input
-                type="number"
-                min={1}
-                max={12}
-                value={batchSize}
-                onChange={(e) => setBatchSize(Number(e.target.value))}
-                className="w-full rounded-lg border border-white/15 bg-[#0B0C0E] px-3.5 py-2.5 text-sm text-white tabular-nums focus:outline-none"
-              />
+        <div className="space-y-6">
+          <form
+            onSubmit={handleSaveSettings}
+            className="max-w-2xl rounded-xl border border-white/10 bg-[#121417] p-6 space-y-5"
+          >
+            <div>
+              <h2 className="font-display text-lg font-bold text-white">
+                Configurações de API, Proxy HTTP→HTTPS & Lotes
+              </h2>
+              <p className="mt-1 text-xs text-white/60">
+                As chaves de API são protegidas por cadeado e salvas no{' '}
+                <code>localStorage</code> e no cache local.
+              </p>
             </div>
 
             <div className="space-y-1.5">
               <label className="block text-xs font-semibold text-white/80">
-                Timeout do Teste de Stream (ms)
+                TMDB API Key (v3 API Key ou Token Bearer v4)
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type={tmdbLocked ? 'password' : 'text'}
+                  value={tmdbLocked ? '••••••••••••' : tmdbKey}
+                  readOnly={tmdbLocked}
+                  disabled={tmdbLocked}
+                  onChange={(e) => setTmdbKey(e.target.value)}
+                  placeholder="Cole sua chave TMDB para sinopse, elenco, nota e Watch Providers BR"
+                  className={`flex-1 rounded-lg border border-white/15 px-3.5 py-2.5 text-sm text-white placeholder:text-white/35 focus:border-white/40 focus:outline-none ${
+                    tmdbLocked
+                      ? 'cursor-not-allowed bg-[#0B0C0E]/60 text-white/55'
+                      : 'bg-[#0B0C0E]'
+                  }`}
+                />
+                <button
+                  type="button"
+                  onClick={() => setTmdbLocked((locked) => !locked)}
+                  aria-label={
+                    tmdbLocked
+                      ? 'Desbloquear campo TMDB API Key'
+                      : 'Bloquear campo TMDB API Key'
+                  }
+                  title={
+                    tmdbLocked
+                      ? 'Desbloquear para visualizar/editar'
+                      : 'Bloquear campo'
+                  }
+                  className={`inline-flex h-[42px] items-center gap-1.5 rounded-lg border px-3.5 text-xs font-semibold transition-colors ${
+                    tmdbLocked
+                      ? 'border-white/15 bg-[#181B20] text-white/80 hover:bg-white/10'
+                      : 'border-amber-400/50 bg-amber-400/15 text-amber-200 hover:bg-amber-400/25'
+                  }`}
+                >
+                  {tmdbLocked ? (
+                    <>
+                      <Lock className="h-4 w-4" />
+                      <span className="hidden sm:inline">Desbloquear</span>
+                    </>
+                  ) : (
+                    <>
+                      <Unlock className="h-4 w-4" />
+                      <span className="hidden sm:inline">Bloquear</span>
+                    </>
+                  )}
+                </button>
+              </div>
+              <p className="text-[11px] text-white/45">
+                {tmdbKey
+                  ? 'Chave TMDB carregada no navegador.'
+                  : 'Nenhuma chave local informada — clique no cadeado para inserir.'}
+              </p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="block text-xs font-semibold text-white/80">
+                YouTube Data API v3 Key
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type={youtubeLocked ? 'password' : 'text'}
+                  value={youtubeLocked ? '••••••••••••' : youtubeKey}
+                  readOnly={youtubeLocked}
+                  disabled={youtubeLocked}
+                  onChange={(e) => setYoutubeKey(e.target.value)}
+                  placeholder="Cole sua chave YouTube Data API v3 (ou deixe vazio para busca automática)"
+                  className={`flex-1 rounded-lg border border-white/15 px-3.5 py-2.5 text-sm text-white placeholder:text-white/35 focus:border-white/40 focus:outline-none ${
+                    youtubeLocked
+                      ? 'cursor-not-allowed bg-[#0B0C0E]/60 text-white/55'
+                      : 'bg-[#0B0C0E]'
+                  }`}
+                />
+                <button
+                  type="button"
+                  onClick={() => setYoutubeLocked((locked) => !locked)}
+                  aria-label={
+                    youtubeLocked
+                      ? 'Desbloquear campo YouTube API Key'
+                      : 'Bloquear campo YouTube API Key'
+                  }
+                  title={
+                    youtubeLocked
+                      ? 'Desbloquear para visualizar/editar'
+                      : 'Bloquear campo'
+                  }
+                  className={`inline-flex h-[42px] items-center gap-1.5 rounded-lg border px-3.5 text-xs font-semibold transition-colors ${
+                    youtubeLocked
+                      ? 'border-white/15 bg-[#181B20] text-white/80 hover:bg-white/10'
+                      : 'border-amber-400/50 bg-amber-400/15 text-amber-200 hover:bg-amber-400/25'
+                  }`}
+                >
+                  {youtubeLocked ? (
+                    <>
+                      <Lock className="h-4 w-4" />
+                      <span className="hidden sm:inline">Desbloquear</span>
+                    </>
+                  ) : (
+                    <>
+                      <Unlock className="h-4 w-4" />
+                      <span className="hidden sm:inline">Bloquear</span>
+                    </>
+                  )}
+                </button>
+              </div>
+              <p className="text-[11px] text-white/45">
+                {youtubeKey
+                  ? 'Chave YouTube carregada no navegador.'
+                  : 'Nenhuma chave local informada — clique no cadeado para inserir.'}
+              </p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="block text-xs font-semibold text-white/80">
+                Prefixo de Proxy CORS / Stream (Opcional — padrão automático: /api/stream?url=)
               </label>
               <input
-                type="number"
-                min={2000}
-                max={15000}
-                step={500}
-                value={probeTimeoutMs}
-                onChange={(e) => setProbeTimeoutMs(Number(e.target.value))}
-                className="w-full rounded-lg border border-white/15 bg-[#0B0C0E] px-3.5 py-2.5 text-sm text-white tabular-nums focus:outline-none"
+                type="text"
+                value={streamProxyPrefix}
+                onChange={(e) => setStreamProxyPrefix(e.target.value)}
+                placeholder="Vazio usa automaticamente /api/stream?url= para links http:// em https://"
+                className="w-full rounded-lg border border-white/15 bg-[#0B0C0E] px-3.5 py-2.5 text-sm text-white placeholder:text-white/35 focus:border-white/40 focus:outline-none"
               />
             </div>
-          </div>
 
-          <div className="flex items-center gap-4 pt-2">
-            <button
-              type="submit"
-              className="inline-flex h-10 items-center justify-center rounded-lg bg-[#E50914] px-5 text-xs font-bold text-white hover:bg-[#c80812]"
-            >
-              Salvar Configurações
-            </button>
-            {settingsSavedMsg && (
-              <span className="text-xs font-medium text-emerald-400">
-                Configurações salvas no localStorage e IndexedDB.
-              </span>
+            <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-white/10 bg-[#0B0C0E]/70 p-4 transition-colors hover:border-white/25">
+              <input
+                type="checkbox"
+                checked={autoProxyHttpStreams}
+                onChange={(e) => setAutoProxyHttpStreams(e.target.checked)}
+                className="mt-0.5 h-4 w-4 rounded border-white/25 bg-[#121417] accent-[#E50914]"
+              />
+              <div className="space-y-1">
+                <span className="block text-xs font-bold text-white">
+                  Modo Proxy Automático (ativado por padrão para links http://)
+                </span>
+                <span className="block text-[11px] leading-relaxed text-white/60">
+                  Roteia automaticamente links <code>http://</code> (incluindo{' '}
+                  <code>.m3u8</code>, segmentos <code>.ts</code> e mídias em
+                  páginas HTTPS) pelo Proxy de servidor com cabeçalhos CORS,
+                  preservando arquivos <code>https://</code> diretos no elemento{' '}
+                  <code>&lt;video&gt;</code> nativo sem{' '}
+                  <code>crossOrigin</code>.
+                </span>
+              </div>
+            </label>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-1.5">
+                <label className="block text-xs font-semibold text-white/80">
+                  Tamanho do Lote (itens simultâneos)
+                </label>
+                <input
+                  type="number"
+                  min={1}
+                  max={12}
+                  value={batchSize}
+                  onChange={(e) => setBatchSize(Number(e.target.value))}
+                  className="w-full rounded-lg border border-white/15 bg-[#0B0C0E] px-3.5 py-2.5 text-sm text-white tabular-nums focus:outline-none"
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="block text-xs font-semibold text-white/80">
+                  Timeout do Teste de Stream (ms)
+                </label>
+                <input
+                  type="number"
+                  min={2000}
+                  max={15000}
+                  step={500}
+                  value={probeTimeoutMs}
+                  onChange={(e) => setProbeTimeoutMs(Number(e.target.value))}
+                  className="w-full rounded-lg border border-white/15 bg-[#0B0C0E] px-3.5 py-2.5 text-sm text-white tabular-nums focus:outline-none"
+                />
+              </div>
+            </div>
+
+            <div className="flex items-center gap-4 pt-2">
+              <button
+                type="submit"
+                className="inline-flex h-10 items-center justify-center rounded-lg bg-[#E50914] px-5 text-xs font-bold text-white hover:bg-[#c80812]"
+              >
+                Salvar Configurações
+              </button>
+              {settingsSavedMsg && (
+                <span className="text-xs font-medium text-emerald-400">
+                  Configurações salvas no dispositivo.
+                </span>
+              )}
+            </div>
+          </form>
+
+          {/* Backup, Migração e Rollback do Acervo */}
+          <div className="max-w-2xl rounded-xl border border-white/10 bg-[#121417] p-6 space-y-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h3 className="font-display text-base font-bold text-white">
+                  Backup, Migração e Rollback do Acervo
+                </h3>
+                <p className="mt-1 text-xs text-white/60">
+                  Gera snapshot automático antes de mesclar fichas, favoritos e
+                  histórico locais com o acervo permanente sem sobrescrever
+                  dados existentes.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap gap-2.5">
+              <button
+                type="button"
+                disabled={migrationBusy || !user}
+                onClick={() => void handleRunManualMigration()}
+                className="inline-flex h-9 items-center gap-2 rounded-lg bg-white px-4 text-xs font-bold text-[#0B0C0E] hover:bg-white/90 disabled:opacity-45"
+              >
+                <Database className="h-3.5 w-3.5" />
+                {migrationBusy
+                  ? 'Processando...'
+                  : 'Criar Backup e Sincronizar Acervo'}
+              </button>
+
+              <button
+                type="button"
+                disabled={migrationBusy}
+                onClick={() => void handleRestoreLocalSnapshot()}
+                className="inline-flex h-9 items-center gap-2 rounded-lg border border-white/15 bg-[#181B20] px-4 text-xs font-semibold text-white hover:bg-white/10 disabled:opacity-45"
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+                Restaurar Snapshot Local
+              </button>
+            </div>
+
+            {!user && (
+              <p className="text-xs text-amber-200/80">
+                Entre com sua conta Google na aba Perfil para habilitar backups
+                e rollback na nuvem.
+              </p>
+            )}
+
+            {migrationMsg && (
+              <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3.5 py-2.5 text-xs text-emerald-200">
+                {migrationMsg}
+              </div>
+            )}
+
+            {migrationBackups.length > 0 && (
+              <div className="space-y-2 pt-2">
+                <p className="text-xs font-semibold text-white/75">
+                  Histórico de Lotes & Backups ({migrationBackups.length})
+                </p>
+                <div className="space-y-2">
+                  {migrationBackups.slice(0, 5).map((b) => (
+                    <div
+                      key={b.id}
+                      className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-white/10 bg-[#0B0C0E] px-3.5 py-2.5 text-xs"
+                    >
+                      <div className="space-y-0.5">
+                        <p className="font-mono text-[11px] text-white/85">
+                          {b.id} ·{' '}
+                          <span
+                            className={
+                              b.status === 'rolled_back'
+                                ? 'text-amber-300'
+                                : 'text-emerald-400'
+                            }
+                          >
+                            {b.status === 'rolled_back'
+                              ? 'Revertido'
+                              : 'Concluído'}
+                          </span>
+                        </p>
+                        <p className="text-[11px] text-white/55 tabular-nums">
+                          {new Date(b.createdAt).toLocaleString('pt-BR')} · +
+                          {b.summary.createdWorks ?? 0} obras ·{' '}
+                          {b.summary.mergedWorks ?? 0} mescladas ·{' '}
+                          {b.summary.migratedHistory ?? 0} históricos
+                        </p>
+                      </div>
+
+                      {b.status === 'completed' && (
+                        <button
+                          type="button"
+                          disabled={migrationBusy}
+                          onClick={() => void handleRollbackServerBackup(b.id)}
+                          className="rounded-md border border-rose-500/35 bg-rose-500/10 px-3 py-1.5 text-[11px] font-semibold text-rose-200 hover:bg-rose-500/20 disabled:opacity-45"
+                        >
+                          Executar Rollback
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
             )}
           </div>
-        </form>
+        </div>
       )}
     </main>
   );

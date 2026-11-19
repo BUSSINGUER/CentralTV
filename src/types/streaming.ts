@@ -22,6 +22,16 @@ export type NavSection =
 
 export type MediaFormatBadge = 'IMAX' | '4K' | 'DOLBY';
 
+export type SourceValidationState =
+  | 'unverified'
+  | 'server_reachable'
+  | 'media_available'
+  | 'playback_confirmed'
+  | 'cors_blocked'
+  | 'proxy_blocked'
+  | 'html_challenge'
+  | 'offline';
+
 export interface MediaSource {
   id: string;
   label: string;
@@ -30,10 +40,14 @@ export interface MediaSource {
   languageTag?: string;
   originalName?: string;
   url: string;
+  resolvedUrl?: string;
+  detectedFormat?: string;
   listId?: string;
   groupTitle?: string;
   tvgId?: string;
   status: 'pending' | 'online' | 'offline';
+  validationState?: SourceValidationState;
+  httpStatus?: number;
   latencyMs?: number;
   reason?: string;
   lastCheckedAt?: number;
@@ -87,6 +101,7 @@ export interface CatalogItem {
   healthChecked?: boolean;
   tmdbEnriched?: boolean;
   youtubeEnriched?: boolean;
+  archived?: boolean;
   lastError?: string;
   createdAt?: number;
   updatedAt?: number;

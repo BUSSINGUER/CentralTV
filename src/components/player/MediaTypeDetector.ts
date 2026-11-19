@@ -97,9 +97,18 @@ export function evaluateNativeCodecSupport(
     const apple =
       video.canPlayType('application/vnd.apple.mpegurl') ||
       video.canPlayType('application/x-mpegURL');
+    const isAppleSafari =
+      typeof navigator !== 'undefined' &&
+      /^((?!chrome|android).)*safari/i.test(navigator.userAgent || '');
+    if (apple && isAppleSafari) {
+      return {
+        canAttemptNative: true,
+        note: `HLS nativo Safari: ${apple}`,
+      };
+    }
     return {
       canAttemptNative: Boolean(apple),
-      note: apple ? `HLS nativo: ${apple}` : 'HLS nativo indisponível; usando HLS.js',
+      note: 'HLS.js (MSE) prioritário',
     };
   }
   return {
@@ -129,3 +138,70 @@ export function classifyM3uContent(text: string): 'hls' | 'm3u_playlist' | 'unkn
   }
   return 'unknown';
 }
+
+export function mapBackendFormatToMediaType(
+  format?: string,
+  contentType?: string,
+  isLive = false
+): DetectedMediaType {
+  const fmt = (format || '').trim().toLowerCase();
+  const ct = (contentType || '').trim().toLowerCase();
+
+  if (fmt === 'mp4' || fmt === 'm4v') return 'mp4';
+  if (fmt === 'webm') return 'webm';
+  if (fmt === 'mkv') return 'mkv';
+  if (fmt === 'avi') return 'avi';
+  if (fmt === 'mov') return 'mov';
+  if (fmt === 'hls' || fmt === 'm3u8') return 'hls';
+  if (fmt === 'dash' || fmt === 'mpd' || fmt === 'shaka') return 'dash';
+  if (fmt === 'mpegts' || fmt === 'ts' || fmt === 'flv') return 'mpegts';
+  if (fmt === 'audio') return 'audio';
+  if (fmt === 'm3u_playlist' || fmt === 'm3u_list') return 'm3u_playlist';
+  if (fmt === 'native') return 'mp4';
+
+  if (ct.includes('mpegurl')) return 'hls';
+  if (ct.includes('dash+xml')) return 'dash';
+  if (ct.includes('mp2t') || ct.includes('x-flv')) return 'mpegts';
+  if (ct.includes('webm')) return 'webm';
+  if (ct.includes('matroska')) return 'mkv';
+  if (ct.includes('quicktime')) return 'mov';
+  if (ct.includes('x-msvideo')) return 'avi';
+  if (ct.includes('mp4')) return 'mp4';
+  if (ct.startsWith('audio/')) return 'audio';
+
+  return isLive ? 'mpegts' : 'unknown';
+}
+
+export function isLikelyDynamicVodUrl(rawUrl: string): boolean {
+  const effective = unwrapTargetUrl(rawUrl);
+  if (!/^https?:\/\//i.test(effective)) return false;
+
+  const cleanPath = getCleanPath(effective);
+  const lower = effective.toLowerCase();
+
+  // Common dynamic/redirect/Xtream patterns or extensionless endpoints
+  if (
+    /\/(?:movie|series|live)\/[^/]+\/[^/]+\/\d+(?:\.[a-z0-9]{2,5})?$/i.test(
+      cleanPath
+    )
+  ) {
+    return true;
+  }
+
+  if (
+    /[?&](?:token|auth|key|sig|signature|expires|hash|redirect|stream|play|id)=/i.test(
+      lower
+    )
+  ) {
+    return true;
+  }
+
+  const lastSegment = cleanPath.split('/').pop() || '';
+  const hasKnownMediaExt =
+    /\.(mp4|m4v|webm|mkv|avi|mov|mpd|m3u8|ts|mp3|aac|ogg|flac)$/i.test(
+      lastSegment
+    );
+
+  return !hasKnownMediaExt;
+}
+

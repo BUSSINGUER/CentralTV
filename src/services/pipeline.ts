@@ -1,10 +1,12 @@
 import Hls from 'hls.js';
 import { db } from '../db/database';
+import { syncCatalogItemsToServer } from './persistenceSync';
 import {
   AppSettings,
   CatalogItem,
   MediaSource,
   PlatformId,
+  SourceValidationState,
 } from '../types/streaming';
 
 export type PipelineStage = 'health' | 'tmdb' | 'youtube' | 'done';
@@ -24,20 +26,38 @@ export interface PipelineProgress {
 async function probeBrowserVideoMetadata(
   url: string,
   timeoutMs: number
-): Promise<boolean> {
-  if (typeof window === 'undefined') return false;
+): Promise<{
+  ok: boolean;
+  validationState: SourceValidationState;
+  reason?: string;
+}> {
+  if (typeof window === 'undefined') {
+    return {
+      ok: false,
+      validationState: 'unverified',
+      reason: 'Ambiente sem navegador para reprodução direta.',
+    };
+  }
   if (window.location.protocol === 'https:' && url.startsWith('http://')) {
-    return false;
+    return {
+      ok: false,
+      validationState: 'cors_blocked',
+      reason: 'Stream HTTP em página HTTPS (requer Proxy / servidor).',
+    };
   }
 
-  return new Promise<boolean>((resolve) => {
+  return new Promise((resolve) => {
     const video = document.createElement('video');
     video.muted = true;
     video.preload = 'metadata';
     let settled = false;
     let hls: Hls | null = null;
 
-    const cleanup = (ok: boolean) => {
+    const cleanup = (
+      ok: boolean,
+      validationState: SourceValidationState,
+      reason?: string
+    ) => {
       if (settled) return;
       settled = true;
       window.clearTimeout(timer);
@@ -47,24 +67,39 @@ async function probeBrowserVideoMetadata(
       }
       video.removeAttribute('src');
       video.load();
-      resolve(ok);
+      resolve({ ok, validationState, reason });
     };
 
     const timer = window.setTimeout(
-      () => cleanup(false),
+      () => cleanup(false, 'cors_blocked', 'Timeout / bloqueio CORS no navegador'),
       Math.min(timeoutMs, 4000)
     );
 
     if (url.toLowerCase().includes('.m3u8') && Hls.isSupported()) {
       hls = new Hls({ enableWorker: false, manifestLoadingTimeOut: 3500 });
-      hls.on(Hls.Events.MANIFEST_PARSED, () => cleanup(true));
+      hls.on(Hls.Events.MANIFEST_PARSED, () =>
+        cleanup(true, 'playback_confirmed', 'Manifesto HLS carregado')
+      );
       hls.on(Hls.Events.ERROR, (_event, data) => {
-        if (data.fatal) cleanup(false);
+        if (data.fatal) {
+          const httpCode = data.response?.code;
+          if (!httpCode && data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            cleanup(false, 'cors_blocked', 'Bloqueio CORS/rede no navegador');
+          } else {
+            cleanup(
+              false,
+              httpCode === 403 ? 'proxy_blocked' : 'offline',
+              `HLS erro ${httpCode || data.details}`
+            );
+          }
+        }
       });
       hls.loadSource(url);
     } else {
-      video.onloadedmetadata = () => cleanup(true);
-      video.onerror = () => cleanup(false);
+      video.onloadedmetadata = () =>
+        cleanup(true, 'playback_confirmed', 'Metadados carregados no navegador');
+      video.onerror = () =>
+        cleanup(false, 'cors_blocked', 'Navegador não conseguiu abrir diretamente');
       video.src = url;
     }
   });
@@ -85,12 +120,40 @@ export async function probeSingleSource(
     if (resp.ok) {
       const data = (await resp.json()) as {
         ok: boolean;
+        validationState?: SourceValidationState;
+        status?: number;
+        resolvedUrl?: string;
+        mediaType?: string;
         latencyMs?: number;
         reason?: string;
       };
+
+      const vState: SourceValidationState =
+        data.validationState ||
+        (data.ok ? 'media_available' : 'offline');
+
+      const mappedStatus: MediaSource['status'] =
+        vState === 'cors_blocked' || vState === 'proxy_blocked'
+          ? 'pending'
+          : vState === 'html_challenge'
+            ? 'online'
+            : data.ok
+              ? 'online'
+              : 'offline';
+
       return {
         ...source,
-        status: data.ok ? 'online' : 'offline',
+        status: mappedStatus,
+        validationState: vState,
+        resolvedUrl:
+          data.resolvedUrl && data.resolvedUrl !== source.url
+            ? data.resolvedUrl
+            : source.resolvedUrl,
+        detectedFormat:
+          data.mediaType && data.mediaType !== 'unknown'
+            ? data.mediaType
+            : source.detectedFormat,
+        httpStatus: data.status ?? source.httpStatus,
         latencyMs: data.latencyMs ?? Math.round(performance.now() - started),
         reason:
           data.reason ||
@@ -98,16 +161,38 @@ export async function probeSingleSource(
         lastCheckedAt: checkedAt,
       };
     }
+
+    if (resp.status === 403) {
+      return {
+        ...source,
+        status: 'pending',
+        validationState: 'proxy_blocked',
+        httpStatus: 403,
+        latencyMs: Math.round(performance.now() - started),
+        reason: 'Validação bloqueada pelo proxy/origem (HTTP 403)',
+        lastCheckedAt: checkedAt,
+      };
+    }
   } catch {
     // Fall through to browser metadata check only if backend endpoint is unreachable
   }
 
-  const browserOk = await probeBrowserVideoMetadata(source.url, timeoutMs);
+  const browserRes = await probeBrowserVideoMetadata(source.url, timeoutMs);
   return {
     ...source,
-    status: browserOk ? 'online' : 'offline',
+    status: browserRes.ok
+      ? 'online'
+      : browserRes.validationState === 'cors_blocked' ||
+          browserRes.validationState === 'proxy_blocked'
+        ? 'pending'
+        : 'offline',
+    validationState: browserRes.validationState,
     latencyMs: Math.round(performance.now() - started),
-    reason: browserOk ? 'Metadados carregados' : 'Stream indisponível / Timeout',
+    reason:
+      browserRes.reason ||
+      (browserRes.ok
+        ? 'Metadados carregados'
+        : 'Stream indisponível / Timeout'),
     lastCheckedAt: checkedAt,
   };
 }
@@ -131,13 +216,23 @@ export async function runHealthCheckForItem(
     sources.map((src) => probeSingleSource(src, timeoutMs))
   );
   const hasOnline = checkedSources.some((s) => s.status === 'online');
+  const hasBlockedNotOffline = checkedSources.some(
+    (s) =>
+      s.validationState === 'cors_blocked' ||
+      s.validationState === 'proxy_blocked' ||
+      s.validationState === 'html_challenge'
+  );
 
   return {
     ...item,
     sources: checkedSources,
     healthChecked: true,
-    status: hasOnline ? 'aprovado' : 'offline',
-    lastError: hasOnline ? undefined : 'Todas as fontes responderam offline.',
+    status: hasOnline ? 'aprovado' : hasBlockedNotOffline ? 'pendente' : 'offline',
+    lastError: hasOnline
+      ? undefined
+      : hasBlockedNotOffline
+        ? 'Fontes bloqueadas por CORS/Proxy/HTML — aguardando verificação na reprodução.'
+        : 'Todas as fontes responderam offline.',
     updatedAt: Date.now(),
   };
 }
@@ -281,12 +376,14 @@ export async function fetchAndCacheTrailerOnDemand(
   if (enriched.youtubeTrailerId) {
     const existing = await db.mediaItems.get(item.id);
     if (existing) {
-      await db.mediaItems.put({
+      const updatedItem = {
         ...existing,
         youtubeTrailerId: enriched.youtubeTrailerId,
         youtubeEnriched: true,
         updatedAt: Date.now(),
-      });
+      };
+      await db.mediaItems.put(updatedItem);
+      void syncCatalogItemsToServer([updatedItem]);
     }
     return enriched.youtubeTrailerId;
   }
@@ -314,6 +411,7 @@ export async function processItemFullPipeline(
   }
 
   await db.mediaItems.put(updated);
+  void syncCatalogItemsToServer([updated]);
   onStage?.('done');
   return updated;
 }

@@ -33,10 +33,16 @@ import {
   saveSettings,
   saveUserLibrary,
 } from './db/database';
+import { useAuth } from './contexts/AuthContext';
 import {
   authorizeStreamOrigins,
   extractUrlsFromCatalogItems,
 } from './services/streamOrigins';
+import {
+  runIndexedDbMigrationToServer,
+  syncFavoritesToServer,
+  syncWorkPatchToServer,
+} from './services/persistenceSync';
 import {
   SaveWatchProgressPayload,
   deriveContinueWatchingEntries,
@@ -60,6 +66,7 @@ import {
 } from './types/streaming';
 
 export default function App() {
+  const { user, signOutGoogle } = useAuth();
   const [publishedDbItems, setPublishedDbItems] = useState<CatalogItem[]>([]);
   const [epgPrograms, setEpgPrograms] = useState<EpgProgram[]>([]);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
@@ -102,12 +109,12 @@ export default function App() {
   } | null>(null);
 
   const platformResultsRef = useRef<HTMLDivElement>(null);
+  const migratedUidRef = useRef<string | null>(null);
 
   const loadPublishedCatalog = useCallback(async () => {
-    const published = await db.mediaItems
-      .where('status')
-      .equals('publicado')
-      .toArray();
+    const published = (
+      await db.mediaItems.where('status').equals('publicado').toArray()
+    ).filter((item) => !item.archived);
     setPublishedDbItems(published);
     void authorizeStreamOrigins(extractUrlsFromCatalogItems(published));
   }, []);
@@ -120,7 +127,7 @@ export default function App() {
   useEffect(() => {
     let mounted = true;
     (async () => {
-      const [loadedSettings, loadedLibrary, published, epg, history] =
+      const [loadedSettings, loadedLibrary, publishedRaw, epg, history] =
         await Promise.all([
           getSettings(),
           getUserLibrary(),
@@ -129,6 +136,7 @@ export default function App() {
           getAllWatchHistory(),
         ]);
       if (!mounted) return;
+      const published = publishedRaw.filter((item) => !item.archived);
       setSettings(loadedSettings);
       setMyListIds(loadedLibrary.myListIds);
       setLegacyContinueWatching(loadedLibrary.continueWatching);
@@ -142,6 +150,48 @@ export default function App() {
       mounted = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (!user) {
+      migratedUidRef.current = null;
+      return;
+    }
+    if (migratedUidRef.current === user.uid) return;
+    migratedUidRef.current = user.uid;
+
+    let active = true;
+    (async () => {
+      const nextSettings = await saveSettings({
+        isLoggedIn: true,
+        userName:
+          user.displayName ||
+          user.email?.split('@')[0] ||
+          settings.userName,
+        userEmail: user.email || settings.userEmail,
+      });
+      if (active) setSettings(nextSettings);
+
+      try {
+        await runIndexedDbMigrationToServer('indexeddb_auto');
+        const [loadedLibrary, publishedRaw, history] = await Promise.all([
+          getUserLibrary(),
+          db.mediaItems.where('status').equals('publicado').toArray(),
+          getAllWatchHistory(),
+        ]);
+        if (!active) return;
+        const published = publishedRaw.filter((item) => !item.archived);
+        setMyListIds(loadedLibrary.myListIds);
+        setWatchHistory(history);
+        setPublishedDbItems(published);
+      } catch {
+        // Keep IndexedDB local cache intact on transient network failure
+      }
+    })();
+
+    return () => {
+      active = false;
+    };
+  }, [user]);
 
   const continueWatching = useMemo(
     () =>
@@ -311,6 +361,7 @@ export default function App() {
         ? prev.filter((id) => id !== itemId)
         : [...prev, itemId];
       void saveUserLibrary({ myListIds: next });
+      void syncFavoritesToServer(next);
       return next;
     });
   };
@@ -504,6 +555,10 @@ export default function App() {
           item.id === itemId ? { ...item, youtubeTrailerId: trailerId } : item
         )
       );
+      void syncWorkPatchToServer(itemId, {
+        youtubeTrailerId: trailerId,
+        youtubeEnriched: true,
+      });
     },
     []
   );
@@ -663,12 +718,13 @@ export default function App() {
 
       {activeSection === 'profile' && (
         <ProfileView
-          userName={settings.userName}
-          userEmail={settings.userEmail}
+          userName={user?.displayName || settings.userName}
+          userEmail={user?.email || settings.userEmail}
           myListItems={myListItems}
           onSelectItem={setModalItem}
           onNavigate={handleNavigate}
           onLogout={() => {
+            void signOutGoogle();
             void saveSettings({ isLoggedIn: false }).then(setSettings);
             handleNavigate('login');
           }}
@@ -714,7 +770,7 @@ export default function App() {
             <span aria-hidden="true">·</span>
             <span>
               {usingRealPublished
-                ? `${publishedDbItems.length} itens publicados via IndexedDB`
+                ? `${publishedDbItems.length} títulos publicados`
                 : 'Curadoria multiplataforma em Dark Mode'}
             </span>
           </div>

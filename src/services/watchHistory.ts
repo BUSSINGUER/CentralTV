@@ -1,5 +1,9 @@
 import { db, getUserLibrary, saveUserLibrary } from '../db/database';
 import {
+  dismissHistoryOnServer,
+  syncWatchHistoryRecordToServer,
+} from './persistenceSync';
+import {
   CatalogItem,
   ContinueWatchingEntry,
   MediaSource,
@@ -181,6 +185,7 @@ export async function saveWatchProgress(
     writeLocalMirror([record, ...mirror]);
   }
 
+  void syncWatchHistoryRecordToServer(record);
   return record;
 }
 
@@ -211,6 +216,7 @@ export async function dismissFromContinueWatching(itemId: string): Promise<void>
       continueWatching: nextContinue,
       dismissedContinueIds: dismissedIds,
     });
+    void dismissHistoryOnServer(itemId);
   } catch {
     // Ignore errors on dismissal
   }

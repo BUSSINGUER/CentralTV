@@ -1,4 +1,4 @@
-import { useMemo, useState, FormEvent } from 'react';
+import { useMemo, useState } from 'react';
 import {
   ArrowLeft,
   Film,
@@ -10,6 +10,7 @@ import {
   Tv,
   User,
 } from 'lucide-react';
+import { useAuth } from '../contexts/AuthContext';
 import {
   LIVE_CHANNELS,
   PLATFORM_LABELS,
@@ -604,7 +605,7 @@ export function ProfileView({
             onClick={onLogout}
             className="rounded-lg border border-[#E50914]/40 bg-[#E50914]/15 px-4 py-2 text-xs font-semibold text-white hover:bg-[#E50914]/25"
           >
-            Sair (Demo)
+            Sair da conta
           </button>
         </div>
       </div>
@@ -667,16 +668,26 @@ interface LoginViewProps {
 }
 
 export function LoginView({ onLoginSuccess, onCancel }: LoginViewProps) {
-  const [email, setEmail] = useState('assinante@aurastream.com.br');
-  const [password, setPassword] = useState('••••••••••');
+  const { signInWithGoogle, authError } = useAuth();
+  const [signingIn, setSigningIn] = useState(false);
 
-  const handleSubmit = (e: FormEvent) => {
-    e.preventDefault();
-    const displayName = email.split('@')[0] || 'Assinante Aura';
-    onLoginSuccess(
-      displayName.charAt(0).toUpperCase() + displayName.slice(1),
-      email
-    );
+  const handleGoogleLogin = async () => {
+    setSigningIn(true);
+    try {
+      const signedUser = await signInWithGoogle();
+      if (signedUser) {
+        const displayName =
+          signedUser.displayName ||
+          signedUser.email?.split('@')[0] ||
+          'Assinante';
+        onLoginSuccess(
+          displayName,
+          signedUser.email || 'conta@centraltv.app'
+        );
+      }
+    } finally {
+      setSigningIn(false);
+    }
   };
 
   return (
@@ -692,45 +703,25 @@ export function LoginView({ onLoginSuccess, onCancel }: LoginViewProps) {
         </div>
 
         <p className="mb-6 text-sm text-white/60">
-          Tela preparatória de autenticação para acesso aos perfis e
-          plataformas conectadas.
+          Entre com sua conta Google para sincronizar sua Minha Lista e o
+          progresso de Continuar Assistindo entre sessões.
         </p>
 
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <label className="mb-1.5 block text-xs font-medium text-white/75">
-              E-mail
-            </label>
-            <input
-              type="email"
-              required
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              className="w-full rounded-lg border border-white/15 bg-[#0B0C0E] px-3.5 py-2.5 text-sm text-white focus:border-white/40 focus:outline-none"
-            />
+        {authError && (
+          <div className="mb-4 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3.5 py-2.5 text-xs text-rose-200">
+            {authError}
           </div>
+        )}
 
-          <div>
-            <label className="mb-1.5 block text-xs font-medium text-white/75">
-              Senha
-            </label>
-            <input
-              type="password"
-              required
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              className="w-full rounded-lg border border-white/15 bg-[#0B0C0E] px-3.5 py-2.5 text-sm text-white focus:border-white/40 focus:outline-none"
-            />
-          </div>
-
-          <button
-            type="submit"
-            className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-[#E50914] text-sm font-bold text-white transition-colors hover:bg-[#c80812]"
-          >
-            <LogIn className="h-4 w-4" />
-            Entrar como Assinante
-          </button>
-        </form>
+        <button
+          type="button"
+          disabled={signingIn}
+          onClick={() => void handleGoogleLogin()}
+          className="inline-flex h-11 w-full items-center justify-center gap-2.5 rounded-lg bg-[#E50914] text-sm font-bold text-white transition-colors hover:bg-[#c80812] disabled:opacity-60"
+        >
+          <LogIn className="h-4 w-4" />
+          {signingIn ? 'Conectando...' : 'Entrar com Google'}
+        </button>
 
         <button
           type="button"

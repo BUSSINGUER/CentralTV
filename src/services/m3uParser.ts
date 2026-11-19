@@ -4,6 +4,14 @@ import {
   extractUrlsFromCatalogItems,
 } from './streamOrigins';
 import {
+  deleteListOnServer,
+  syncCatalogItemsToServer,
+} from './persistenceSync';
+import {
+  buildProvisionalKey,
+  getCandidateProvisionalKeys,
+} from '../utils/identity';
+import {
   CatalogItem,
   M3uListRecord,
   MediaFormatBadge,
@@ -26,6 +34,7 @@ export interface M3UImportStats {
   mergedSources: number;
   ignoredDuplicates: number;
   byKind: Record<MediaKind, number>;
+  touchedItemIds?: string[];
 }
 
 export interface M3UImportOptions {
@@ -431,38 +440,31 @@ export async function importM3UFromStream(
     mergedSources: 0,
     ignoredDuplicates: 0,
     byKind: { movie: 0, series: 0, live: 0, radio: 0 },
+    touchedItemIds: [],
   };
 
   const existingItems = await db.mediaItems.toArray();
   const itemByKey = new Map<string, CatalogItem>();
-  const itemByTitleKindNoYear = new Map<string, CatalogItem>();
+  const touchedIdSet = new Set<string>();
 
   for (const existing of existingItems) {
     if (existing.normalizedKey) {
       itemByKey.set(existing.normalizedKey, existing);
     }
-    const kind = existing.type;
-    const titleKey = normalizeTextKey(existing.title);
-    const derivedKey =
-      kind === 'live'
-        ? `live::${titleKey}`
-        : `${kind}::${titleKey}::${existing.year ?? ''}`;
-    if (!itemByKey.has(derivedKey)) {
-      itemByKey.set(derivedKey, existing);
-    }
-    if (existing.originalTitle) {
-      const cleanedOrig = cleanTitleAndExtractYear(existing.originalTitle);
-      const origKey =
-        kind === 'live'
-          ? `live::${normalizeTextKey(normalizeLiveChannelName(existing.originalTitle).cleanChannelName)}`
-          : `${kind}::${normalizeTextKey(cleanedOrig.cleanTitle)}::${cleanedOrig.year ?? existing.year ?? ''}`;
-      if (!itemByKey.has(origKey)) {
-        itemByKey.set(origKey, existing);
+    const parsedOrigYear = existing.originalTitle
+      ? cleanTitleAndExtractYear(existing.originalTitle).year
+      : undefined;
+    const effectiveYear = existing.tmdbEnriched ? existing.year : parsedOrigYear;
+    const candidateKeys = getCandidateProvisionalKeys({
+      type: existing.type,
+      title: existing.title,
+      originalTitle: existing.originalTitle,
+      year: effectiveYear,
+    });
+    for (const k of candidateKeys) {
+      if (!itemByKey.has(k)) {
+        itemByKey.set(k, existing);
       }
-    }
-    const noYearKey = `${kind}::${titleKey}`;
-    if (!itemByTitleKindNoYear.has(noYearKey)) {
-      itemByTitleKindNoYear.set(noYearKey, existing);
     }
   }
 
@@ -473,14 +475,18 @@ export async function importM3UFromStream(
 
   const flushBatch = async () => {
     if (dirtyItems.size === 0) return;
-    const batch = Array.from(dirtyItems.values()).map((it) => ({
-      ...it,
-      sources: sortAndRelabelSources(it.sources || []),
-      episodes: it.episodes?.map((ep) => ({
-        ...ep,
-        sources: sortAndRelabelSources(ep.sources || []),
-      })),
-    }));
+    const batch = Array.from(dirtyItems.values()).map((it) => {
+      touchedIdSet.add(it.id);
+      return {
+        ...it,
+        archived: false,
+        sources: sortAndRelabelSources(it.sources || []),
+        episodes: it.episodes?.map((ep) => ({
+          ...ep,
+          sources: sortAndRelabelSources(ep.sources || []),
+        })),
+      };
+    });
     dirtyItems.clear();
     await db.mediaItems.bulkPut(batch);
   };
@@ -554,17 +560,16 @@ export async function importM3UFromStream(
       languageTag = tags.languageTag;
     }
 
-    const normalizedKey =
-      mediaKind === 'live'
-        ? `live::${normalizeTextKey(groupItemTitle)}`
-        : `${mediaKind}::${normalizeTextKey(groupItemTitle)}::${year ?? ''}`;
+    const normalizedKey = buildProvisionalKey({
+      type: mediaKind,
+      title: groupItemTitle,
+      originalTitle: rawTitle,
+      year,
+    });
 
     stats.rawEntries += 1;
     const now = Date.now();
-    const noYearLookupKey = `${mediaKind}::${normalizeTextKey(groupItemTitle)}`;
-    let item =
-      itemByKey.get(normalizedKey) ||
-      (!year ? itemByTitleKindNoYear.get(noYearLookupKey) : undefined);
+    let item = itemByKey.get(normalizedKey);
 
     const isBrandNewItem = !item;
 
@@ -622,6 +627,7 @@ export async function importM3UFromStream(
         sources: [],
         episodes: mediaKind === 'series' ? [] : undefined,
         status: 'pendente',
+        archived: false,
         healthChecked: false,
         tmdbEnriched: false,
         youtubeEnriched: false,
@@ -630,15 +636,15 @@ export async function importM3UFromStream(
       };
 
       itemByKey.set(normalizedKey, item);
-      if (!itemByTitleKindNoYear.has(noYearLookupKey)) {
-        itemByTitleKindNoYear.set(noYearLookupKey, item);
-      }
       stats.groupedItems += 1;
       stats.newItems += 1;
       stats.byKind[mediaKind] += 1;
     }
 
-    let itemModified = isBrandNewItem;
+    let itemModified = isBrandNewItem || Boolean(item.archived);
+    if (item.archived) {
+      item.archived = false;
+    }
 
     if (!item.tvgId && meta.tvgId) {
       item.tvgId = meta.tvgId;
@@ -806,6 +812,7 @@ export async function importM3UFromStream(
   }
 
   await flushBatch();
+  stats.touchedItemIds = Array.from(touchedIdSet);
   if (discoveredOrigins.size > 0) {
     await authorizeStreamOrigins(Array.from(discoveredOrigins));
   }
@@ -858,10 +865,19 @@ export async function unifyAndReclassifyCatalog(): Promise<{
       year = cleaned.year || oldItem.year;
     }
 
-    const key =
-      newKind === 'live'
-        ? `live::${normalizeTextKey(cleanTitle)}`
-        : `${newKind}::${normalizeTextKey(cleanTitle)}::${year ?? ''}`;
+    const cleanedOrigYear = oldItem.originalTitle
+      ? cleanTitleAndExtractYear(oldItem.originalTitle).year
+      : undefined;
+    const effectiveYear =
+      oldItem.tmdbEnriched ? oldItem.year : year ?? cleanedOrigYear;
+    const key = oldItem.tmdbId
+      ? `${newKind}::tmdb::${oldItem.tmdbId}`
+      : buildProvisionalKey({
+          type: newKind,
+          title: cleanTitle,
+          originalTitle: oldItem.originalTitle,
+          year: effectiveYear,
+        });
 
     const enrichSource = (src: MediaSource): MediaSource => {
       const srcName = src.originalName || rawTitle;
@@ -997,6 +1013,7 @@ export async function unifyAndReclassifyCatalog(): Promise<{
   await db.mediaItems.clear();
   if (nextList.length > 0) {
     await db.mediaItems.bulkPut(nextList);
+    await syncCatalogItemsToServer(nextList, undefined, true);
   }
 
   return {
@@ -1009,19 +1026,21 @@ export async function unifyAndReclassifyCatalog(): Promise<{
 export const reclassifyAndRegroupCatalog = unifyAndReclassifyCatalog;
 
 /**
- * Surgically deletes a single M3U list:
+ * Surgically deletes a single M3U list without erasing title sheets, IDs, favorites, or watch history:
  * - Removes only sources linked to listId.
  * - Keeps items that still have >= 1 active source from other lists (reordering 4K priority).
- * - Removes items that drop to 0 remaining sources.
+ * - Archives items that drop to 0 remaining sources so metadata, favorites, and progress are preserved until re-import.
  */
 export async function deleteM3uList(listId: string): Promise<{
   removedItems: number;
+  archivedItems: number;
   updatedItems: number;
   removedSources: number;
 }> {
   const allItems = await db.mediaItems.toArray();
-  const idsToDelete: string[] = [];
   const itemsToUpdate: CatalogItem[] = [];
+  let archivedItems = 0;
+  let updatedItems = 0;
   let removedSources = 0;
 
   for (const item of allItems) {
@@ -1032,16 +1051,14 @@ export async function deleteM3uList(listId: string): Promise<{
     let removedFromEps = 0;
     let nextEpisodes = item.episodes;
     if (item.episodes && item.episodes.length > 0) {
-      nextEpisodes = item.episodes
-        .map((ep) => {
-          const filtered = ep.sources.filter((s) => s.listId !== listId);
-          removedFromEps += ep.sources.length - filtered.length;
-          return {
-            ...ep,
-            sources: sortAndRelabelSources(filtered),
-          };
-        })
-        .filter((ep) => ep.sources.length > 0);
+      nextEpisodes = item.episodes.map((ep) => {
+        const filtered = ep.sources.filter((s) => s.listId !== listId);
+        removedFromEps += ep.sources.length - filtered.length;
+        return {
+          ...ep,
+          sources: sortAndRelabelSources(filtered),
+        };
+      });
     }
 
     if (removedFromMain === 0 && removedFromEps === 0) {
@@ -1051,11 +1068,20 @@ export async function deleteM3uList(listId: string): Promise<{
     removedSources += removedFromMain + removedFromEps;
 
     const hasRemainingSources =
-      nextSources.length > 0 || (nextEpisodes?.length ?? 0) > 0;
+      nextSources.length > 0 ||
+      (nextEpisodes?.some((ep) => ep.sources.length > 0) ?? false);
 
     if (!hasRemainingSources) {
-      idsToDelete.push(item.id);
+      archivedItems += 1;
+      itemsToUpdate.push({
+        ...item,
+        sources: [],
+        episodes: nextEpisodes,
+        archived: true,
+        updatedAt: Date.now(),
+      });
     } else {
+      updatedItems += 1;
       const sortedSources = sortAndRelabelSources(nextSources);
       const has4k = sortedSources.some(
         (s) => s.resolutionTag === '4K' || s.qualityTag?.includes('4K')
@@ -1063,13 +1089,14 @@ export async function deleteM3uList(listId: string): Promise<{
 
       let duration = item.duration;
       if (item.type === 'series' && nextEpisodes) {
+        const activeEps = nextEpisodes.filter((ep) => ep.sources.length > 0);
         const maxSeason = Math.max(
-          ...nextEpisodes.map((e) => e.season),
+          ...activeEps.map((e) => e.season),
           1
         );
         duration = `${maxSeason} ${
           maxSeason === 1 ? 'Temporada' : 'Temporadas'
-        } · ${nextEpisodes.length} eps`;
+        } · ${activeEps.length} eps`;
       }
 
       itemsToUpdate.push({
@@ -1077,6 +1104,7 @@ export async function deleteM3uList(listId: string): Promise<{
         sources: sortedSources,
         episodes: nextEpisodes,
         duration,
+        archived: false,
         qualityBadge: has4k
           ? '4K'
           : item.qualityBadge === '4K'
@@ -1087,17 +1115,16 @@ export async function deleteM3uList(listId: string): Promise<{
     }
   }
 
-  if (idsToDelete.length > 0) {
-    await db.mediaItems.bulkDelete(idsToDelete);
-  }
   if (itemsToUpdate.length > 0) {
     await db.mediaItems.bulkPut(itemsToUpdate);
   }
   await db.m3u_lists.delete(listId);
+  await deleteListOnServer(listId);
 
   return {
-    removedItems: idsToDelete.length,
-    updatedItems: itemsToUpdate.length,
+    removedItems: archivedItems,
+    archivedItems,
+    updatedItems,
     removedSources,
   };
 }
@@ -1131,6 +1158,15 @@ async function persistListSummary(
     ignoredDuplicatesCount: stats.ignoredDuplicates,
   };
   await saveM3uListRecord(record);
+
+  const touchedIds = stats.touchedItemIds || [];
+  const touchedItems =
+    touchedIds.length > 0
+      ? (await db.mediaItems.bulkGet(touchedIds)).filter((it): it is CatalogItem =>
+          Boolean(it)
+        )
+      : [];
+  await syncCatalogItemsToServer(touchedItems, record, false);
 }
 
 export function normalizeServerUrl(rawServerUrl: string): string {
@@ -1419,28 +1455,29 @@ export async function importCatalogFromJson(
     mergedSources: 0,
     ignoredDuplicates: 0,
     byKind: { movie: 0, series: 0, live: 0, radio: 0 },
+    touchedItemIds: [],
   };
 
   const existingItems = await db.mediaItems.toArray();
   const itemByKey = new Map<string, CatalogItem>();
-  const itemByTitleKindNoYear = new Map<string, CatalogItem>();
 
   for (const existing of existingItems) {
     if (existing.normalizedKey) {
       itemByKey.set(existing.normalizedKey, existing);
     }
-    const kind = existing.type;
-    const titleKey = normalizeTextKey(existing.title);
-    const derivedKey =
-      kind === 'live'
-        ? `live::${titleKey}`
-        : `${kind}::${titleKey}::${existing.year ?? ''}`;
-    if (!itemByKey.has(derivedKey)) {
-      itemByKey.set(derivedKey, existing);
-    }
-    const noYearKey = `${kind}::${titleKey}`;
-    if (!itemByTitleKindNoYear.has(noYearKey)) {
-      itemByTitleKindNoYear.set(noYearKey, existing);
+    const parsedOrigYear = existing.originalTitle
+      ? cleanTitleAndExtractYear(existing.originalTitle).year
+      : undefined;
+    const effectiveYear = existing.tmdbEnriched ? existing.year : parsedOrigYear;
+    for (const k of getCandidateProvisionalKeys({
+      type: existing.type,
+      title: existing.title,
+      originalTitle: existing.originalTitle,
+      year: effectiveYear,
+    })) {
+      if (!itemByKey.has(k)) {
+        itemByKey.set(k, existing);
+      }
     }
   }
 
@@ -1495,15 +1532,14 @@ export async function importCatalogFromJson(
       languageTag = tags.languageTag;
     }
 
-    const normalizedKey =
-      mediaKind === 'live'
-        ? `live::${normalizeTextKey(groupItemTitle)}`
-        : `${mediaKind}::${normalizeTextKey(groupItemTitle)}::${year ?? ''}`;
+    const normalizedKey = buildProvisionalKey({
+      type: mediaKind,
+      title: groupItemTitle,
+      originalTitle: rawTitle,
+      year,
+    });
 
-    const noYearLookupKey = `${mediaKind}::${normalizeTextKey(groupItemTitle)}`;
-    let item =
-      itemByKey.get(normalizedKey) ||
-      (!year ? itemByTitleKindNoYear.get(noYearLookupKey) : undefined);
+    let item = itemByKey.get(normalizedKey);
 
     const isBrandNewItem = !item;
 
@@ -1568,6 +1604,7 @@ export async function importCatalogFromJson(
         sources: [],
         episodes: mediaKind === 'series' ? [] : undefined,
         status: 'pendente',
+        archived: false,
         healthChecked: false,
         tmdbEnriched: false,
         youtubeEnriched: Boolean(entry.youtubeTrailerId),
@@ -1576,15 +1613,15 @@ export async function importCatalogFromJson(
       };
 
       itemByKey.set(normalizedKey, item);
-      if (!itemByTitleKindNoYear.has(noYearLookupKey)) {
-        itemByTitleKindNoYear.set(noYearLookupKey, item);
-      }
       stats.groupedItems += 1;
       stats.newItems += 1;
       stats.byKind[mediaKind] += 1;
     }
 
-    let itemModified = isBrandNewItem;
+    let itemModified = isBrandNewItem || Boolean(item.archived);
+    if (item.archived) {
+      item.archived = false;
+    }
     const existingSources = item.sources ?? [];
     const alreadyHasUrl = existingSources.some((s) => s.url === entry.url);
 
@@ -1682,12 +1719,14 @@ export async function importCatalogFromJson(
   if (dirtyItems.size > 0) {
     const batch = Array.from(dirtyItems.values()).map((it) => ({
       ...it,
+      archived: false,
       sources: sortAndRelabelSources(it.sources || []),
       episodes: it.episodes?.map((ep) => ({
         ...ep,
         sources: sortAndRelabelSources(ep.sources || []),
       })),
     }));
+    stats.touchedItemIds = batch.map((b) => b.id);
     await db.mediaItems.bulkPut(batch);
     await authorizeStreamOrigins(extractUrlsFromCatalogItems(batch));
   }

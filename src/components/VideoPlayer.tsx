@@ -18,6 +18,7 @@ import {
   Volume2,
   VolumeX,
 } from 'lucide-react';
+import { db } from '../db/database';
 import { PLATFORM_LABELS } from '../data/catalog';
 import {
   authorizeStreamOrigins,
@@ -28,8 +29,16 @@ import {
   findPreferredSourceIndex,
   getNextSeriesEpisode,
 } from '../services/watchHistory';
-import { CatalogItem, MediaSource, SeriesEpisode } from '../types/streaming';
-import { HybridPlayer } from './HybridPlayer';
+import {
+  CatalogItem,
+  MediaSource,
+  SeriesEpisode,
+  SourceValidationState,
+} from '../types/streaming';
+import {
+  HybridPlayer,
+  HybridPlayerValidationResult,
+} from './HybridPlayer';
 import { MediaImage } from './MediaImage';
 
 interface VideoPlayerProps {
@@ -67,6 +76,55 @@ function formatTime(totalSeconds: number): string {
   return `${pad(mins)}:${pad(secs)}`;
 }
 
+function mapValidationToSourceStatus(
+  validationState: SourceValidationState,
+  prevStatus: MediaSource['status']
+): MediaSource['status'] {
+  if (
+    validationState === 'playback_confirmed' ||
+    validationState === 'media_available' ||
+    validationState === 'server_reachable'
+  ) {
+    return 'online';
+  }
+  if (
+    validationState === 'cors_blocked' ||
+    validationState === 'proxy_blocked' ||
+    validationState === 'html_challenge'
+  ) {
+    return prevStatus === 'online' ? 'online' : 'pending';
+  }
+  if (validationState === 'offline') {
+    return 'offline';
+  }
+  return prevStatus;
+}
+
+function formatSourceBadge(src: MediaSource): string {
+  switch (src.validationState) {
+    case 'playback_confirmed':
+      return 'Confirmada';
+    case 'media_available':
+      return 'Mídia OK';
+    case 'server_reachable':
+      return 'Acessível';
+    case 'cors_blocked':
+      return 'Bloq. CORS';
+    case 'proxy_blocked':
+      return 'Bloq. Proxy';
+    case 'html_challenge':
+      return 'HTML / WAF';
+    case 'offline':
+      return 'Offline';
+    default:
+      return src.status === 'online'
+        ? 'Online'
+        : src.status === 'offline'
+          ? 'Offline'
+          : 'Stream';
+  }
+}
+
 export function VideoPlayer({
   item,
   season,
@@ -88,21 +146,30 @@ export function VideoPlayer({
   onSelectEpisode,
   onClose,
 }: VideoPlayerProps) {
+  const [sourceOverrides, setSourceOverrides] = useState<
+    Record<string, Partial<MediaSource>>
+  >({});
+
   const availableSources = useMemo<MediaSource[]>(() => {
     const base = sources && sources.length > 0 ? sources : item?.sources ?? [];
-    if (streamUrl && !base.some((s) => s.url === streamUrl)) {
-      return [
-        {
-          id: 'direct-url',
-          label: 'Fonte Direta',
-          url: streamUrl,
-          status: 'pending',
-        },
-        ...base,
-      ];
-    }
-    return base;
-  }, [sources, item?.sources, streamUrl]);
+    const combined =
+      streamUrl && !base.some((s) => s.url === streamUrl)
+        ? [
+            {
+              id: 'direct-url',
+              label: 'Fonte Direta',
+              url: streamUrl,
+              status: 'pending' as const,
+            },
+            ...base,
+          ]
+        : base;
+
+    return combined.map((s) => {
+      const ov = sourceOverrides[s.id] || sourceOverrides[s.url];
+      return ov ? { ...s, ...ov } : s;
+    });
+  }, [sources, item?.sources, streamUrl, sourceOverrides]);
 
   const initialSourceIdx = useMemo(() => {
     return findPreferredSourceIndex(availableSources, {
@@ -145,6 +212,7 @@ export function VideoPlayer({
   const [nextEpCountdown, setNextEpCountdown] = useState<number>(10);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const failedSourceIndicesRef = useRef<Set<number>>(new Set());
   const lastSavedAtRef = useRef<number>(0);
   const latestTimeRef = useRef<{ currentTime: number; duration: number }>({
     currentTime: 0,
@@ -224,6 +292,8 @@ export function VideoPlayer({
   }, [item, availableSources]);
 
   useEffect(() => {
+    failedSourceIndicesRef.current = new Set();
+    setSourceOverrides({});
     setSourceIndex(initialSourceIdx);
     setForceInternalProxy(false);
     setPlaybackError(null);
@@ -265,10 +335,75 @@ export function VideoPlayer({
     }
   }, [item, rawStreamUrl, sourceIndex, forceInternalProxy, activeSource?.label]);
 
+  const handleValidationResult = useCallback(
+    async (res: HybridPlayerValidationResult) => {
+      if (!activeSource) return;
+      const now = Date.now();
+      const nextStatus = mapValidationToSourceStatus(
+        res.validationState,
+        activeSource.status
+      );
+      const patch: Partial<MediaSource> = {
+        status: nextStatus,
+        validationState: res.validationState,
+        resolvedUrl: res.resolvedUrl || activeSource.resolvedUrl,
+        detectedFormat: res.detectedFormat || activeSource.detectedFormat,
+        httpStatus: res.httpStatus ?? activeSource.httpStatus,
+        reason: res.reason ?? activeSource.reason,
+        lastCheckedAt: now,
+      };
+
+      setSourceOverrides((prev) => ({
+        ...prev,
+        [activeSource.id]: patch,
+        [activeSource.url]: patch,
+      }));
+
+      if (!item?.id || activeSource.id === 'direct-url') return;
+
+      try {
+        const stored = await db.mediaItems.get(item.id);
+        if (!stored) return;
+
+        const updateSourceList = (list: MediaSource[] | undefined) =>
+          (list || []).map((src) =>
+            src.id === activeSource.id || src.url === activeSource.url
+              ? { ...src, ...patch }
+              : src
+          );
+
+        const updatedSources = updateSourceList(stored.sources);
+        const updatedEpisodes = stored.episodes?.map((ep) => ({
+          ...ep,
+          sources: updateSourceList(ep.sources),
+        }));
+
+        await db.mediaItems.put({
+          ...stored,
+          sources: updatedSources,
+          episodes: updatedEpisodes,
+          updatedAt: now,
+        });
+      } catch {
+        // Non-fatal IndexedDB update error
+      }
+    },
+    [activeSource, item?.id]
+  );
+
   const advanceToNextSourceOrFail = useCallback(
     (reason: string, isMixedOrCors: boolean) => {
-      if (sourceIndex + 1 < availableSources.length) {
-        const nextIdx = sourceIndex + 1;
+      failedSourceIndicesRef.current.add(sourceIndex);
+      let nextIdx = -1;
+      for (let offset = 1; offset < availableSources.length; offset++) {
+        const candidate = (sourceIndex + offset) % availableSources.length;
+        if (!failedSourceIndicesRef.current.has(candidate)) {
+          nextIdx = candidate;
+          break;
+        }
+      }
+
+      if (nextIdx !== -1) {
         setStatusMessage(
           `Falha na ${activeSource?.label || 'fonte atual'}. Tentando ${
             availableSources[nextIdx].label
@@ -417,6 +552,9 @@ export function VideoPlayer({
             forceProxy={forceInternalProxy}
             enablePreflight={true}
             onVideoElement={handleVideoElement}
+            onValidationResult={(res) => {
+              void handleValidationResult(res);
+            }}
             onBufferingChange={(buffering, msg) => {
               setIsBuffering(buffering);
               if (msg) setStatusMessage(msg);
@@ -803,6 +941,7 @@ export function VideoPlayer({
                         key={src.id}
                         type="button"
                         onClick={() => {
+                          failedSourceIndicesRef.current.delete(idx);
                           setSourceIndex(idx);
                           setShowSourcesMenu(false);
                         }}
@@ -816,11 +955,7 @@ export function VideoPlayer({
                           {src.label}
                         </span>
                         <span className="shrink-0 text-[10px] opacity-85">
-                          {src.status === 'online'
-                            ? 'Online'
-                            : src.status === 'offline'
-                              ? 'Offline'
-                              : 'Stream'}
+                          {formatSourceBadge(src)}
                         </span>
                       </button>
                     ))

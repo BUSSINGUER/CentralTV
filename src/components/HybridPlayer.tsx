@@ -1,15 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Hls from 'hls.js';
 import mpegts from 'mpegts.js';
-import {
-  Activity,
-  AlertTriangle,
-  ChevronDown,
-  ChevronUp,
-  Loader2,
-  Play,
-} from 'lucide-react';
+import { AlertTriangle, Loader2, Play } from 'lucide-react';
 import { redactUrlCredentials } from '../services/streamOrigins';
+import { SourceValidationState } from '../types/streaming';
 
 import {
   DetectedMediaType,
@@ -19,16 +13,20 @@ import {
   classifyM3uContent,
   unwrapTargetUrl,
   getCleanPath,
+  mapBackendFormatToMediaType,
+  isLikelyDynamicVodUrl,
 } from './player/MediaTypeDetector';
 import {
   PlaybackAttempt,
   applyStreamProxyUrl,
   buildPlaybackAttempts,
+  resolveVodSource,
 } from './player/MediaSourceResolver';
 import {
   PlayerDiagnostics,
   DiagnosticHttpEntry,
   DiagnosticHlsError,
+  DiagnosticAttemptEntry,
   MEDIA_ERROR_LABELS,
   createInitialDiagnostics,
   PlayerDiagnosticsPanel,
@@ -40,6 +38,7 @@ export type {
   PlayerDiagnostics,
   DiagnosticHttpEntry,
   DiagnosticHlsError,
+  DiagnosticAttemptEntry,
 };
 
 export interface HybridPlayerError {
@@ -48,6 +47,15 @@ export interface HybridPlayerError {
   httpStatus?: number;
   mediaErrorCode?: number;
   mediaErrorMessage?: string;
+  validationState?: SourceValidationState;
+}
+
+export interface HybridPlayerValidationResult {
+  validationState: SourceValidationState;
+  resolvedUrl?: string;
+  detectedFormat?: string;
+  httpStatus?: number;
+  reason?: string;
 }
 
 export interface HybridPlayerProps {
@@ -69,6 +77,7 @@ export interface HybridPlayerProps {
   onVideoElement?: (video: HTMLVideoElement | null) => void;
   onEngineChange?: (engine: HybridEngineKind) => void;
   onDiagnosticsChange?: (diag: PlayerDiagnostics) => void;
+  onValidationResult?: (result: HybridPlayerValidationResult) => void;
   onBufferingChange?: (buffering: boolean, statusMessage?: string) => void;
   onReady?: (durationSeconds: number) => void;
   onTimeUpdate?: (currentTime: number, duration: number) => void;
@@ -89,6 +98,15 @@ interface ShakaPlayerInstance {
   destroy: () => Promise<void>;
 }
 
+interface ResolvedSessionState {
+  sessionKey: string;
+  resolvedUrl?: string;
+  mediaType: DetectedMediaType;
+  redirectCount: number;
+  initialValidationState?: SourceValidationState;
+  fatalPreflightError?: HybridPlayerError;
+}
+
 export function HybridPlayer({
   url,
   title,
@@ -104,10 +122,11 @@ export function HybridPlayer({
   streamProxyPrefix = '',
   autoProxyHttpStreams = true,
   forceProxy = false,
-  enablePreflight = false,
+  enablePreflight = true,
   onVideoElement,
   onEngineChange,
   onDiagnosticsChange,
+  onValidationResult,
   onBufferingChange,
   onReady,
   onTimeUpdate,
@@ -120,6 +139,14 @@ export function HybridPlayer({
   const initialMediaType = useMemo(
     () => detectMediaTypeFromUrl(url, isLive),
     [url, isLive]
+  );
+
+  const sessionKey = useMemo(
+    () =>
+      `${url}|${isLive ? 1 : 0}|${forceProxy ? 1 : 0}|${
+        autoProxyHttpStreams ? 1 : 0
+      }|${streamProxyPrefix}`,
+    [url, isLive, forceProxy, autoProxyHttpStreams, streamProxyPrefix]
   );
 
   const [isBuffering, setIsBuffering] = useState(true);
@@ -135,6 +162,8 @@ export function HybridPlayer({
     createInitialDiagnostics(url, initialMediaType)
   );
   const [diagExpanded, setDiagExpanded] = useState(true);
+  const [resolvedSession, setResolvedSession] =
+    useState<ResolvedSessionState | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
@@ -143,6 +172,8 @@ export function HybridPlayer({
   const failTimeoutRef = useRef<number | null>(null);
   const playStartPerfRef = useRef<number>(performance.now());
   const firstFrameRecordedRef = useRef(false);
+  const validationEmittedRef = useRef(false);
+  const sessionGenRef = useRef(0);
   const isPlayingRef = useRef(isPlaying);
   isPlayingRef.current = isPlaying;
 
@@ -155,6 +186,7 @@ export function HybridPlayer({
     onVideoElement,
     onEngineChange,
     onDiagnosticsChange,
+    onValidationResult,
     onBufferingChange,
     onReady,
     onTimeUpdate,
@@ -167,6 +199,7 @@ export function HybridPlayer({
     onVideoElement,
     onEngineChange,
     onDiagnosticsChange,
+    onValidationResult,
     onBufferingChange,
     onReady,
     onTimeUpdate,
@@ -186,29 +219,6 @@ export function HybridPlayer({
     },
     []
   );
-
-  const attempts = useMemo(
-    () =>
-      buildPlaybackAttempts(
-        url,
-        initialMediaType,
-        streamProxyPrefix,
-        autoProxyHttpStreams,
-        forceProxy
-      ),
-    [url, initialMediaType, streamProxyPrefix, autoProxyHttpStreams, forceProxy]
-  );
-
-  useEffect(() => {
-    setAttemptIndex(0);
-    setErrorState(null);
-    setAutoplayBlocked(false);
-    setIsReady(false);
-    setIsBuffering(Boolean(url));
-    setDirectVideoSrc(undefined);
-    firstFrameRecordedRef.current = false;
-    setDiagnostics(createInitialDiagnostics(url, initialMediaType));
-  }, [url, initialMediaType, forceProxy, autoProxyHttpStreams, streamProxyPrefix]);
 
   // Stable ref callback so parent re-renders NEVER detach/reattach <video>
   const setVideoNode = useCallback((node: HTMLVideoElement | null) => {
@@ -275,6 +285,204 @@ export function HybridPlayer({
     }
   }, []);
 
+  // Step 1: Resolve dynamic VOD / redirects BEFORE creating playback attempts
+  useEffect(() => {
+    sessionGenRef.current += 1;
+    const myGen = sessionGenRef.current;
+
+    destroyPlayers(true);
+    setAttemptIndex(0);
+    setErrorState(null);
+    setAutoplayBlocked(false);
+    setIsReady(false);
+    setIsBuffering(Boolean(url));
+    setDirectVideoSrc(undefined);
+    firstFrameRecordedRef.current = false;
+    validationEmittedRef.current = false;
+    setDiagnostics(createInitialDiagnostics(url, initialMediaType));
+
+    const trimmedUrl = url.trim();
+    if (!trimmedUrl) {
+      setResolvedSession({
+        sessionKey,
+        mediaType: initialMediaType,
+        redirectCount: 0,
+      });
+      return;
+    }
+
+    const effectiveRaw = unwrapTargetUrl(trimmedUrl);
+    const shouldResolveVod =
+      /^https?:\/\//i.test(effectiveRaw) &&
+      (enablePreflight ||
+        isLikelyDynamicVodUrl(effectiveRaw) ||
+        getCleanPath(effectiveRaw).endsWith('.m3u'));
+
+    if (!shouldResolveVod || trimmedUrl.startsWith('/api/stream')) {
+      setResolvedSession({
+        sessionKey,
+        mediaType: initialMediaType,
+        redirectCount: 0,
+      });
+      return;
+    }
+
+    const controller = new AbortController();
+    setStatusMessage('Resolvendo endereço e formato do stream...');
+    callbacksRef.current.onBufferingChange?.(
+      true,
+      'Resolvendo endereço e formato do stream...'
+    );
+
+    const resolve = async () => {
+      try {
+        const res = await resolveVodSource(effectiveRaw, {
+          timeoutMs: 5500,
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted || myGen !== sessionGenRef.current) return;
+
+        const mappedFromRes = mapBackendFormatToMediaType(
+          res.mediaType || res.detectedEngine,
+          res.contentType,
+          isLive
+        );
+        const resolvedType =
+          mappedFromRes !== 'unknown'
+            ? mappedFromRes
+            : initialMediaType;
+
+        patchDiagnostics((prev) => ({
+          ...prev,
+          mediaType: resolvedType,
+          resolvedUrlRedacted:
+            res.finalUrlRedacted || redactUrlCredentials(res.resolvedUrl || effectiveRaw),
+          redirectCount: res.redirectCount || 0,
+          validationResult: res.validationState || prev.validationResult,
+          ...(res.status > 0 || res.reason
+            ? {
+                httpStatuses: [
+                  ...prev.httpStatuses.slice(-7),
+                  {
+                    urlRedacted:
+                      res.finalUrlRedacted || redactUrlCredentials(effectiveRaw),
+                    status: res.status || res.validationState,
+                    contentType: res.contentType,
+                    note: res.reason,
+                    timestampMs: Date.now(),
+                  },
+                ],
+              }
+            : {}),
+        }));
+
+        if (res.isM3uList || resolvedType === 'm3u_playlist') {
+          setResolvedSession({
+            sessionKey,
+            resolvedUrl: res.resolvedUrl,
+            mediaType: 'm3u_playlist',
+            redirectCount: res.redirectCount,
+            initialValidationState: 'offline',
+            fatalPreflightError: {
+              reason:
+                res.reason ||
+                'A URL aponta para uma lista M3U de canais e não para um vídeo/manifesto HLS.',
+              isMixedContentOrCors: false,
+              httpStatus: res.status || 422,
+              validationState: 'offline',
+            },
+          });
+          return;
+        }
+
+        const isSsrfBlocked =
+          res.status === 403 && /ssrf|bloquead/i.test(res.reason || '');
+        if (isSsrfBlocked) {
+          setResolvedSession({
+            sessionKey,
+            resolvedUrl: effectiveRaw,
+            mediaType: resolvedType,
+            redirectCount: 0,
+            initialValidationState: 'proxy_blocked',
+            fatalPreflightError: {
+              reason: res.reason || 'Acesso bloqueado por segurança (SSRF).',
+              isMixedContentOrCors: false,
+              httpStatus: 403,
+              validationState: 'proxy_blocked',
+            },
+          });
+          return;
+        }
+
+        // Preserve original url when resolvedUrl matches or is empty; otherwise pass resolvedUrl
+        const nextResolvedUrl =
+          res.resolvedUrl && res.resolvedUrl !== effectiveRaw
+            ? res.resolvedUrl
+            : undefined;
+
+        setResolvedSession({
+          sessionKey,
+          resolvedUrl: nextResolvedUrl,
+          mediaType: resolvedType,
+          redirectCount: res.redirectCount || 0,
+          initialValidationState: res.validationState,
+        });
+      } catch (err) {
+        if ((err as Error)?.name === 'AbortError' || myGen !== sessionGenRef.current) {
+          return;
+        }
+        setResolvedSession({
+          sessionKey,
+          mediaType: initialMediaType,
+          redirectCount: 0,
+        });
+      }
+    };
+
+    void resolve();
+
+    return () => {
+      controller.abort();
+    };
+  }, [
+    url,
+    sessionKey,
+    initialMediaType,
+    isLive,
+    enablePreflight,
+    destroyPlayers,
+    patchDiagnostics,
+  ]);
+
+  const activeResolved =
+    resolvedSession && resolvedSession.sessionKey === sessionKey
+      ? resolvedSession
+      : null;
+
+  const activeMediaType = activeResolved?.mediaType ?? initialMediaType;
+
+  const attempts = useMemo(
+    () =>
+      activeResolved
+        ? buildPlaybackAttempts(
+            url,
+            activeMediaType,
+            streamProxyPrefix,
+            autoProxyHttpStreams,
+            forceProxy,
+            activeResolved.resolvedUrl
+          )
+        : [],
+    [
+      url,
+      activeResolved,
+      activeMediaType,
+      streamProxyPrefix,
+      autoProxyHttpStreams,
+      forceProxy,
+    ]
+  );
+
   const attemptManualPlay = useCallback(async () => {
     const video = videoRef.current;
     if (!video) return;
@@ -296,10 +504,12 @@ export function HybridPlayer({
     }
   }, [patchDiagnostics]);
 
+  // Step 2: Execute active attempt using resolved metadata & engine selection
   useEffect(() => {
     const video = videoRef.current;
-    if (!video) return;
+    if (!video || !activeResolved) return;
 
+    const myGen = sessionGenRef.current;
     destroyPlayers(false);
     setIsReady(false);
     setErrorState(null);
@@ -307,14 +517,48 @@ export function HybridPlayer({
     firstFrameRecordedRef.current = false;
     playStartPerfRef.current = performance.now();
 
+    const emitValidationOnce = (result: HybridPlayerValidationResult) => {
+      if (validationEmittedRef.current || myGen !== sessionGenRef.current) return;
+      validationEmittedRef.current = true;
+      patchDiagnostics((prev) => ({
+        ...prev,
+        validationResult: result.validationState,
+        finalOutcome:
+          result.validationState === 'playback_confirmed' ? 'playing' : 'failed',
+      }));
+      callbacksRef.current.onValidationResult?.(result);
+    };
+
+    if (activeResolved.fatalPreflightError) {
+      const fatalErr = activeResolved.fatalPreflightError;
+      setDirectVideoSrc(undefined);
+      setIsBuffering(false);
+      setErrorState(fatalErr);
+      emitValidationOnce({
+        validationState: fatalErr.validationState || 'offline',
+        resolvedUrl: activeResolved.resolvedUrl,
+        detectedFormat: activeMediaType,
+        httpStatus: fatalErr.httpStatus,
+        reason: fatalErr.reason,
+      });
+      callbacksRef.current.onBufferingChange?.(false, '');
+      callbacksRef.current.onError?.(fatalErr);
+      return;
+    }
+
     if (!url || attempts.length === 0) {
       setDirectVideoSrc(undefined);
       const emptyErr: HybridPlayerError = {
         reason: 'Nenhuma URL de stream informada para reprodução.',
         isMixedContentOrCors: false,
+        validationState: 'offline',
       };
       setIsBuffering(false);
       setErrorState(emptyErr);
+      emitValidationOnce({
+        validationState: 'offline',
+        reason: emptyErr.reason,
+      });
       callbacksRef.current.onBufferingChange?.(false, '');
       callbacksRef.current.onError?.(emptyErr);
       return;
@@ -323,30 +567,63 @@ export function HybridPlayer({
     const currentAttempt = attempts[attemptIndex] || attempts[attempts.length - 1];
     const targetUrl = currentAttempt.url;
     const isProxyTarget = currentAttempt.mode === 'proxy';
+    const currentAttemptNumber = attemptIndex + 1;
 
     let cancelled = false;
     let readyFired = false;
     let seekApplied = false;
     let handledFailure = false;
+    let currentEngine: HybridEngineKind = 'none';
     const abortController = new AbortController();
 
-    const codecCheck = evaluateNativeCodecSupport(video, initialMediaType);
+    const isStale = () => cancelled || myGen !== sessionGenRef.current;
+
+    const codecCheck = evaluateNativeCodecSupport(video, activeMediaType);
     patchDiagnostics((prev) => ({
       ...prev,
-      mediaType: initialMediaType,
+      mediaType: activeMediaType,
       codecSupportNote: codecCheck.note,
       finalUrlRedacted: redactUrlCredentials(targetUrl),
+      finalOutcome: 'loading',
+      attemptsLog: [
+        ...prev.attemptsLog.slice(-9),
+        {
+          attemptNumber: currentAttemptNumber,
+          mode: currentAttempt.mode,
+          label: currentAttempt.label,
+          engine: 'none',
+          urlRedacted: redactUrlCredentials(targetUrl),
+          status: 'trying',
+          timestampMs: Date.now(),
+        },
+      ],
     }));
 
+    const updateCurrentAttemptLog = (
+      patch: Partial<DiagnosticAttemptEntry>
+    ) => {
+      if (isStale()) return;
+      patchDiagnostics((prev) => {
+        const list = [...prev.attemptsLog];
+        for (let i = list.length - 1; i >= 0; i--) {
+          if (list[i].attemptNumber === currentAttemptNumber) {
+            list[i] = { ...list[i], ...patch };
+            break;
+          }
+        }
+        return { ...prev, attemptsLog: list };
+      });
+    };
+
     const updateBuffering = (buffering: boolean, msg = '') => {
-      if (cancelled) return;
+      if (isStale()) return;
       setIsBuffering(buffering);
       setStatusMessage(msg);
       callbacksRef.current.onBufferingChange?.(buffering, msg);
     };
 
     const recordHttp = (entry: Omit<DiagnosticHttpEntry, 'timestampMs'>) => {
-      if (cancelled) return;
+      if (isStale()) return;
       patchDiagnostics((prev) => ({
         ...prev,
         httpStatuses: [
@@ -362,6 +639,7 @@ export function HybridPlayer({
       reason: string;
       isMixedContentOrCors: boolean;
       httpStatus?: number;
+      validationState?: SourceValidationState;
     }> => {
       const isHttpsPage =
         typeof window !== 'undefined' && window.location.protocol === 'https:';
@@ -384,41 +662,69 @@ export function HybridPlayer({
             const errCode = resp.headers.get('x-aura-error-code') || '';
             const upstreamStatus = resp.headers.get('x-aura-upstream-status');
             const upstreamCt = resp.headers.get('x-aura-upstream-content-type') || '';
-            const bodyText = !resp.ok ? (await resp.text().catch(() => '')).slice(0, 200) : '';
+            const bodyText = !resp.ok
+              ? (await resp.text().catch(() => '')).slice(0, 200)
+              : '';
 
             recordHttp({
               urlRedacted: redactUrlCredentials(failedUrl),
               status: resp.status,
               contentType: upstreamCt || resp.headers.get('content-type') || '',
-              note: errCode || (upstreamStatus ? `upstream=${upstreamStatus}` : undefined),
+              note:
+                errCode || (upstreamStatus ? `upstream=${upstreamStatus}` : undefined),
             });
 
             if (errCode === 'upstream_html') {
               return {
-                reason: `O servidor de origem respondeu HTTP ${upstreamStatus || resp.status} com página HTML (${upstreamCt || 'text/html'}) em vez de vídeo (ex.: conta expirada, debug mode ou link offline).`,
+                reason: `O servidor de origem respondeu HTTP ${
+                  upstreamStatus || resp.status
+                } com página HTML (${
+                  upstreamCt || 'text/html'
+                }) em vez de vídeo (ex.: proteção anti-bot, link temporário expirado ou indisponível).`,
                 isMixedContentOrCors: false,
                 httpStatus: resp.status,
+                validationState: 'html_challenge',
               };
             }
             if (errCode === 'm3u_playlist_not_hls') {
               return {
-                reason: 'A URL aponta para uma lista M3U de canais e não para um stream de vídeo ou manifesto HLS.',
+                reason:
+                  'A URL aponta para uma lista M3U de canais e não para um stream de vídeo ou manifesto HLS.',
                 isMixedContentOrCors: false,
                 httpStatus: resp.status,
+                validationState: 'offline',
               };
             }
             if (errCode === 'origin_not_allowed' || errCode === 'ssrf_blocked') {
               return {
-                reason: bodyText || `Proxy bloqueou a requisição (${errCode}, HTTP ${resp.status}).`,
+                reason:
+                  bodyText ||
+                  `Proxy bloqueou a requisição (${errCode}, HTTP ${resp.status}).`,
                 isMixedContentOrCors: false,
                 httpStatus: resp.status,
+                validationState: 'proxy_blocked',
+              };
+            }
+            if (resp.status === 401 || resp.status === 403 || resp.status === 429) {
+              return {
+                reason:
+                  bodyText ||
+                  `Servidor de origem ou proxy recusou o acesso (HTTP ${
+                    upstreamStatus || resp.status
+                  }).`,
+                isMixedContentOrCors: false,
+                httpStatus: resp.status,
+                validationState: 'proxy_blocked',
               };
             }
             if (resp.status >= 400) {
               return {
-                reason: bodyText || `Servidor de origem retornou HTTP ${upstreamStatus || resp.status}.`,
+                reason:
+                  bodyText ||
+                  `Servidor de origem retornou HTTP ${upstreamStatus || resp.status}.`,
                 isMixedContentOrCors: false,
                 httpStatus: resp.status,
+                validationState: resp.status >= 500 ? 'proxy_blocked' : 'offline',
               };
             }
           } else if (resp.ok) {
@@ -427,6 +733,7 @@ export function HybridPlayer({
               status?: number;
               contentType?: string;
               reason?: string;
+              validationState?: SourceValidationState;
             } | null;
             if (check) {
               recordHttp({
@@ -440,6 +747,29 @@ export function HybridPlayer({
                   reason: check.reason || `Servidor respondeu HTTP ${check.status}`,
                   isMixedContentOrCors: false,
                   httpStatus: check.status,
+                  validationState: check.validationState || 'offline',
+                };
+              }
+              if (check.validationState === 'html_challenge') {
+                return {
+                  reason:
+                    check.reason ||
+                    `Servidor acessível, porém retornou proteção HTML (HTTP ${check.status}).`,
+                  isMixedContentOrCors: false,
+                  httpStatus: check.status,
+                  validationState: 'html_challenge',
+                };
+              }
+              if (
+                check.validationState === 'media_available' ||
+                check.validationState === 'server_reachable'
+              ) {
+                return {
+                  reason:
+                    'Servidor acessível, mas o navegador bloqueou a reprodução direta (CORS / codec incompatível).',
+                  isMixedContentOrCors: true,
+                  httpStatus: check.status,
+                  validationState: 'cors_blocked',
                 };
               }
             }
@@ -454,12 +784,19 @@ export function HybridPlayer({
           reason:
             'Conteúdo misto (HTTP em página HTTPS) bloqueado pelo navegador ao tentar reprodução direta.',
           isMixedContentOrCors: true,
+          validationState: 'cors_blocked',
         };
       }
 
       return {
         reason: 'Não foi possível reproduzir este stream.',
         isMixedContentOrCors: false,
+        validationState:
+          activeResolved.initialValidationState === 'html_challenge'
+            ? 'html_challenge'
+            : isProxyTarget
+              ? 'proxy_blocked'
+              : 'offline',
       };
     };
 
@@ -470,33 +807,46 @@ export function HybridPlayer({
         httpStatus?: number;
         skipAdvance?: boolean;
         mediaErr?: { code: number; label: string; message: string } | null;
+        validationState?: SourceValidationState;
       }
     ) => {
-      if (cancelled || handledFailure) return;
+      if (isStale() || handledFailure) return;
       handledFailure = true;
       if (failTimeoutRef.current) {
         window.clearTimeout(failTimeoutRef.current);
         failTimeoutRef.current = null;
       }
 
+      const elapsedMs = Math.max(
+        1,
+        Math.round(performance.now() - playStartPerfRef.current)
+      );
+
       const diagnosed =
-        opts?.httpStatus || opts?.mediaErr?.code === 3
+        opts?.httpStatus || opts?.mediaErr?.code === 3 || opts?.validationState
           ? {
               reason: rawReason,
               isMixedContentOrCors: Boolean(opts?.isMixedOrCors),
               httpStatus: opts?.httpStatus,
+              validationState: opts?.validationState,
             }
           : await diagnoseHttpResponseOnFailure(targetUrl);
 
-      if (cancelled) return;
+      if (isStale()) return;
 
       const finalReason =
         diagnosed.reason !== 'Não foi possível reproduzir este stream.'
           ? diagnosed.reason
           : rawReason;
 
-      // Do not retry proxy if the failure is an unsupported local container/codec (MEDIA_ERR_DECODE)
-      // or an M3U playlist mistakenly treated as a video stream
+      updateCurrentAttemptLog({
+        status: 'failed',
+        engine: currentEngine,
+        httpStatus: diagnosed.httpStatus,
+        errorMessage: finalReason,
+        durationMs: elapsedMs,
+      });
+
       const canAdvance =
         !opts?.skipAdvance &&
         attemptIndex + 1 < attempts.length &&
@@ -509,7 +859,7 @@ export function HybridPlayer({
           `Falha em ${currentAttempt.label}. Tentando ${nextAttempt.label}...`
         );
         window.setTimeout(() => {
-          if (!cancelled) {
+          if (!isStale()) {
             destroyPlayers(true);
             setDirectVideoSrc(undefined);
             setAttemptIndex((idx) => idx + 1);
@@ -518,18 +868,44 @@ export function HybridPlayer({
         return;
       }
 
+      const resolvedValidationState: SourceValidationState =
+        diagnosed.validationState ||
+        (diagnosed.isMixedContentOrCors
+          ? 'cors_blocked'
+          : activeResolved.initialValidationState === 'html_challenge'
+            ? 'html_challenge'
+            : activeResolved.initialValidationState === 'media_available' ||
+                activeResolved.initialValidationState === 'server_reachable'
+              ? isProxyTarget
+                ? 'proxy_blocked'
+                : 'cors_blocked'
+              : isProxyTarget && (diagnosed.httpStatus === 403 || !diagnosed.httpStatus)
+                ? 'proxy_blocked'
+                : 'offline');
+
       const finalError: HybridPlayerError = {
         reason: finalReason,
-        isMixedContentOrCors: diagnosed.isMixedContentOrCors,
+        isMixedContentOrCors:
+          diagnosed.isMixedContentOrCors ||
+          resolvedValidationState === 'cors_blocked',
         httpStatus: diagnosed.httpStatus,
         mediaErrorCode: opts?.mediaErr?.code,
         mediaErrorMessage: opts?.mediaErr?.message,
+        validationState: resolvedValidationState,
       };
 
       updateBuffering(false, '');
       setErrorState(finalError);
+      emitValidationOnce({
+        validationState: resolvedValidationState,
+        resolvedUrl: activeResolved.resolvedUrl,
+        detectedFormat: activeMediaType,
+        httpStatus: diagnosed.httpStatus,
+        reason: finalReason,
+      });
+
       window.setTimeout(() => {
-        if (!cancelled) {
+        if (!isStale()) {
           destroyPlayers(true);
           setDirectVideoSrc(undefined);
           callbacksRef.current.onError?.(finalError);
@@ -538,7 +914,7 @@ export function HybridPlayer({
     };
 
     const markFirstFrameIfNeeded = () => {
-      if (cancelled || firstFrameRecordedRef.current) return;
+      if (isStale() || firstFrameRecordedRef.current) return;
       firstFrameRecordedRef.current = true;
       const elapsed = Math.max(
         1,
@@ -547,15 +923,28 @@ export function HybridPlayer({
       patchDiagnostics((prev) => ({
         ...prev,
         timeToFirstFrameMs: elapsed,
+        finalOutcome: 'playing',
       }));
+      updateCurrentAttemptLog({
+        status: 'playing',
+        engine: currentEngine,
+        durationMs: elapsed,
+      });
+      emitValidationOnce({
+        validationState: 'playback_confirmed',
+        resolvedUrl: activeResolved.resolvedUrl,
+        detectedFormat: activeMediaType,
+        httpStatus: 200,
+        reason: `Reprodução confirmada via ${currentEngine} (${elapsed} ms)`,
+      });
     };
 
     const tryAutoPlayWithRecovery = () => {
-      if (cancelled || !isPlayingRef.current) return;
+      if (isStale() || !isPlayingRef.current) return;
       const p = video.play();
       if (p && typeof p.catch === 'function') {
         p.catch((err: unknown) => {
-          if (cancelled) return;
+          if (isStale()) return;
           const e = err as DOMException | Error;
           const name = e?.name || 'PlayError';
           const message = e?.message || 'Rejeição em video.play()';
@@ -565,7 +954,6 @@ export function HybridPlayer({
           }));
 
           if (name === 'NotAllowedError') {
-            // Autoplay with audio blocked -> surface manual play button cleanly instead of fake error
             setAutoplayBlocked(true);
             updateBuffering(false, '');
             callbacksRef.current.onPlayStateChange?.(false);
@@ -580,7 +968,7 @@ export function HybridPlayer({
     };
 
     const applyInitialResumeSeek = () => {
-      if (cancelled || seekApplied || isLive) return;
+      if (isStale() || seekApplied || isLive) return;
       const vidDur =
         video.duration && Number.isFinite(video.duration)
           ? Math.floor(video.duration)
@@ -607,78 +995,8 @@ export function HybridPlayer({
       }
     };
 
-    const wireCommonVideoDiagnosticListeners = () => {
-      video.onloadedmetadata = () => {
-        if (cancelled) return;
-        patchDiagnostics((prev) => ({
-          ...prev,
-          loadedmetadata: {
-            fired: true,
-            timestampMs: Date.now(),
-            width: video.videoWidth || undefined,
-            height: video.videoHeight || undefined,
-            duration:
-              video.duration && Number.isFinite(video.duration)
-                ? Math.round(video.duration)
-                : undefined,
-          },
-        }));
-        applyInitialResumeSeek();
-        markReady();
-      };
-
-      video.onloadeddata = () => {
-        if (cancelled) return;
-        applyInitialResumeSeek();
-        markFirstFrameIfNeeded();
-      };
-
-      video.oncanplay = () => {
-        if (cancelled) return;
-        patchDiagnostics((prev) => ({
-          ...prev,
-          canplay: { fired: true, timestampMs: Date.now() },
-        }));
-        applyInitialResumeSeek();
-        markReady();
-      };
-
-      video.onplaying = () => {
-        if (cancelled) return;
-        setAutoplayBlocked(false);
-        markFirstFrameIfNeeded();
-        patchDiagnostics((prev) => ({
-          ...prev,
-          playing: { fired: true, timestampMs: Date.now() },
-        }));
-      };
-
-      video.onstalled = () => {
-        if (cancelled) return;
-        patchDiagnostics((prev) => ({
-          ...prev,
-          stalled: {
-            count: prev.stalled.count + 1,
-            lastTimestampMs: Date.now(),
-          },
-        }));
-      };
-
-      video.onresize = () => {
-        if (cancelled || !video.videoWidth || !video.videoHeight) return;
-        patchDiagnostics((prev) => ({
-          ...prev,
-          loadedmetadata: {
-            ...prev.loadedmetadata,
-            width: video.videoWidth,
-            height: video.videoHeight,
-          },
-        }));
-      };
-    };
-
     const markReady = () => {
-      if (cancelled) return;
+      if (isStale()) return;
       applyInitialResumeSeek();
       if (readyFired) return;
       readyFired = true;
@@ -701,6 +1019,76 @@ export function HybridPlayer({
       callbacksRef.current.onReady?.(vidDur);
     };
 
+    const wireCommonVideoDiagnosticListeners = () => {
+      video.onloadedmetadata = () => {
+        if (isStale()) return;
+        patchDiagnostics((prev) => ({
+          ...prev,
+          loadedmetadata: {
+            fired: true,
+            timestampMs: Date.now(),
+            width: video.videoWidth || undefined,
+            height: video.videoHeight || undefined,
+            duration:
+              video.duration && Number.isFinite(video.duration)
+                ? Math.round(video.duration)
+                : undefined,
+          },
+        }));
+        applyInitialResumeSeek();
+        markReady();
+      };
+
+      video.onloadeddata = () => {
+        if (isStale()) return;
+        applyInitialResumeSeek();
+        markFirstFrameIfNeeded();
+      };
+
+      video.oncanplay = () => {
+        if (isStale()) return;
+        patchDiagnostics((prev) => ({
+          ...prev,
+          canplay: { fired: true, timestampMs: Date.now() },
+        }));
+        applyInitialResumeSeek();
+        markReady();
+      };
+
+      video.onplaying = () => {
+        if (isStale()) return;
+        setAutoplayBlocked(false);
+        markFirstFrameIfNeeded();
+        patchDiagnostics((prev) => ({
+          ...prev,
+          playing: { fired: true, timestampMs: Date.now() },
+        }));
+      };
+
+      video.onstalled = () => {
+        if (isStale()) return;
+        patchDiagnostics((prev) => ({
+          ...prev,
+          stalled: {
+            count: prev.stalled.count + 1,
+            lastTimestampMs: Date.now(),
+          },
+        }));
+      };
+
+      video.onresize = () => {
+        if (isStale() || !video.videoWidth || !video.videoHeight) return;
+        patchDiagnostics((prev) => ({
+          ...prev,
+          loadedmetadata: {
+            ...prev.loadedmetadata,
+            width: video.videoWidth,
+            height: video.videoHeight,
+          },
+        }));
+      };
+    };
+
     const armLoadTimeout = () => {
       if (failTimeoutRef.current) {
         window.clearTimeout(failTimeoutRef.current);
@@ -714,19 +1102,21 @@ export function HybridPlayer({
     };
 
     const setEngine = (engine: HybridEngineKind) => {
+      currentEngine = engine;
+      updateCurrentAttemptLog({ engine });
       patchDiagnostics((prev) => ({ ...prev, engine }));
       callbacksRef.current.onEngineChange?.(engine);
     };
 
     const initShaka = async (dashUrl: string) => {
-      if (cancelled || !videoRef.current) return;
+      if (isStale() || !videoRef.current) return;
       try {
         setDirectVideoSrc(undefined);
         setEngine('shaka');
         updateBuffering(true, `Carregando MPEG-DASH (${currentAttempt.label})...`);
 
         const shakaModule = await import('shaka-player');
-        if (cancelled || !videoRef.current) return;
+        if (isStale() || !videoRef.current) return;
 
         const shaka = shakaModule.default;
         shaka.polyfill?.installAll?.();
@@ -743,48 +1133,60 @@ export function HybridPlayer({
 
         player.addEventListener('error', (event) => {
           const detail = event.detail as
-            | { code?: number; message?: string }
+            | { code?: number; message?: string; severity?: number; data?: unknown[] }
             | undefined;
           const codeLabel = detail?.code ? `código ${detail.code}` : 'erro de rede';
-          void failOrAdvanceAttempt(`Erro no Shaka Player (${codeLabel}).`);
+          const isNetworkOrCors =
+            detail?.code !== undefined &&
+            detail.code >= 1000 &&
+            detail.code < 2000;
+          void failOrAdvanceAttempt(
+            `Erro no Shaka Player (${codeLabel}${
+              detail?.message ? `: ${detail.message}` : ''
+            }).`,
+            { isMixedOrCors: isNetworkOrCors && !isProxyTarget }
+          );
         });
 
         await player.attach(videoRef.current);
-        if (cancelled) {
+        if (isStale()) {
           await player.destroy().catch(() => {});
           return;
         }
 
         wireCommonVideoDiagnosticListeners();
         await player.load(dashUrl);
-        if (!cancelled) {
+        if (!isStale()) {
           markReady();
         }
       } catch (err) {
-        if (!cancelled) {
+        if (!isStale()) {
           const msg =
             err instanceof Error
               ? err.message
               : 'Falha ao carregar manifesto no Shaka Player.';
-          void failOrAdvanceAttempt(msg);
+          void failOrAdvanceAttempt(msg, { isMixedOrCors: !isProxyTarget });
         }
       }
     };
 
     const initHlsPlayback = async (hlsUrl: string) => {
-      if (cancelled || !videoRef.current) return;
+      if (isStale() || !videoRef.current) return;
       setDirectVideoSrc(undefined);
 
-      // 1. Prioritize native HLS when genuinely available (Safari / iOS)
       const nativeHlsSupport =
         video.canPlayType('application/vnd.apple.mpegurl') ||
         video.canPlayType('application/x-mpegURL');
+      const isAppleSafari =
+        typeof navigator !== 'undefined' &&
+        /^((?!chrome|android).)*safari/i.test(navigator.userAgent || '');
 
-      if (nativeHlsSupport) {
+      if (nativeHlsSupport && (!Hls.isSupported() || isAppleSafari)) {
         setEngine('native-hls');
         updateBuffering(true, `Carregando HLS nativo (${currentAttempt.label})...`);
         wireCommonVideoDiagnosticListeners();
         video.onerror = () => {
+          if (isStale()) return;
           const code = video.error?.code || 0;
           const mediaErr = code
             ? {
@@ -806,16 +1208,15 @@ export function HybridPlayer({
         return;
       }
 
-      // 2. Use HLS.js when native HLS is not available and MSE is supported
       if (!Hls.isSupported()) {
         void initShaka(hlsUrl);
         return;
       }
 
-      // Verify manifest is genuinely HLS (never an IPTV channel M3U list)
       if (hlsUrl.startsWith('/api/stream')) {
         try {
           const headCheck = await fetch(hlsUrl, { signal: abortController.signal });
+          if (isStale()) return;
           recordHttp({
             urlRedacted: redactUrlCredentials(hlsUrl),
             status: headCheck.status,
@@ -823,16 +1224,23 @@ export function HybridPlayer({
           });
           if (!headCheck.ok) {
             const errCode = headCheck.headers.get('x-aura-error-code') || '';
-            const upstreamStatus = Number(headCheck.headers.get('x-aura-upstream-status') || headCheck.status);
+            const upstreamStatus = Number(
+              headCheck.headers.get('x-aura-upstream-status') || headCheck.status
+            );
             const text = await headCheck.text().catch(() => '');
             void failOrAdvanceAttempt(
               text || `Manifesto HLS retornou HTTP ${upstreamStatus}`,
               {
                 httpStatus: headCheck.status,
-                skipAdvance:
-                  errCode === 'm3u_playlist_not_hls' ||
-                  errCode === 'origin_not_allowed' ||
-                  errCode === 'ssrf_blocked',
+                validationState:
+                  errCode === 'upstream_html'
+                    ? 'html_challenge'
+                    : errCode === 'origin_not_allowed' || errCode === 'ssrf_blocked'
+                      ? 'proxy_blocked'
+                      : errCode === 'm3u_playlist_not_hls'
+                        ? 'offline'
+                        : undefined,
+                skipAdvance: errCode === 'm3u_playlist_not_hls',
               }
             );
             return;
@@ -841,16 +1249,16 @@ export function HybridPlayer({
           if (classifyM3uContent(manifestText) === 'm3u_playlist') {
             void failOrAdvanceAttempt(
               'O link aponta para uma lista M3U de canais e não para um manifesto HLS (.m3u8).',
-              { skipAdvance: true, httpStatus: 422 }
+              { skipAdvance: true, httpStatus: 422, validationState: 'offline' }
             );
             return;
           }
         } catch (err) {
-          if (cancelled || (err as Error)?.name === 'AbortError') return;
+          if (isStale() || (err as Error)?.name === 'AbortError') return;
         }
       }
 
-      if (cancelled) return;
+      if (isStale()) return;
       setEngine('hls.js');
       updateBuffering(true, `Carregando HLS.js (${currentAttempt.label})...`);
       wireCommonVideoDiagnosticListeners();
@@ -884,14 +1292,15 @@ export function HybridPlayer({
       });
       hlsRef.current = hls;
 
-      let mediaRecoveryAttempted = false;
-      let networkRecoveryAttempted = false;
+      let mediaRecoveryCount = 0;
+      let networkRecoveryCount = 0;
 
       hls.on(Hls.Events.MANIFEST_LOADED, (_ev, data) => {
-        if (cancelled) return;
-        const respCode = data.networkDetails instanceof XMLHttpRequest
-          ? data.networkDetails.status
-          : 200;
+        if (isStale()) return;
+        const respCode =
+          data.networkDetails instanceof XMLHttpRequest
+            ? data.networkDetails.status
+            : 200;
         recordHttp({
           urlRedacted: redactUrlCredentials(data.url || hlsUrl),
           status: respCode || 200,
@@ -900,13 +1309,11 @@ export function HybridPlayer({
       });
 
       hls.on(Hls.Events.FRAG_LOADED, (_ev, data) => {
-        if (cancelled) return;
+        if (isStale()) return;
         if (!firstFrameRecordedRef.current) {
-          const statsStatus =
-            data.frag?.stats?.loading?.start ? 200 : 200;
           recordHttp({
             urlRedacted: redactUrlCredentials(data.frag?.url || ''),
-            status: statsStatus,
+            status: 200,
             note: `Seg #${data.frag?.sn ?? 0}`,
           });
         }
@@ -915,7 +1322,7 @@ export function HybridPlayer({
       hls.on(Hls.Events.MANIFEST_PARSED, markReady);
 
       hls.on(Hls.Events.ERROR, (_ev, data) => {
-        if (cancelled) return;
+        if (isStale()) return;
         const httpCode = data.response?.code;
         patchDiagnostics((prev) => ({
           ...prev,
@@ -947,18 +1354,21 @@ export function HybridPlayer({
 
         if (!data.fatal) return;
 
-        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !mediaRecoveryAttempted) {
-          mediaRecoveryAttempted = true;
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveryCount < 2) {
+          mediaRecoveryCount += 1;
+          if (mediaRecoveryCount === 2) {
+            hls.swapAudioCodec();
+          }
           hls.recoverMediaError();
           return;
         }
 
         if (
           data.type === Hls.ErrorTypes.NETWORK_ERROR &&
-          !networkRecoveryAttempted &&
+          networkRecoveryCount < 1 &&
           (!httpCode || httpCode >= 500)
         ) {
-          networkRecoveryAttempted = true;
+          networkRecoveryCount += 1;
           hls.startLoad();
           return;
         }
@@ -973,6 +1383,10 @@ export function HybridPlayer({
         void failOrAdvanceAttempt(reason, {
           httpStatus: httpCode,
           isMixedOrCors: isStatusZeroCorsCandidate && !isProxyTarget,
+          validationState:
+            isStatusZeroCorsCandidate && !isProxyTarget
+              ? 'cors_blocked'
+              : undefined,
         });
       });
 
@@ -981,7 +1395,7 @@ export function HybridPlayer({
     };
 
     const initMpegTs = (tsUrl: string) => {
-      if (cancelled || !videoRef.current) return;
+      if (isStale() || !videoRef.current) return;
       setDirectVideoSrc(undefined);
       if (!mpegts.isSupported()) {
         void initShaka(tsUrl);
@@ -990,7 +1404,10 @@ export function HybridPlayer({
 
       try {
         setEngine('mpegts.js');
-        updateBuffering(true, `Conectando transmissão MPEG-TS (${currentAttempt.label})...`);
+        updateBuffering(
+          true,
+          `Conectando transmissão MPEG-TS (${currentAttempt.label})...`
+        );
         wireCommonVideoDiagnosticListeners();
 
         mpegts.LoggingControl?.applyConfig({
@@ -1022,8 +1439,10 @@ export function HybridPlayer({
         tsPlayer.attachMediaElement(video);
         tsPlayer.on(mpegts.Events.MEDIA_INFO, markReady);
         tsPlayer.on(mpegts.Events.ERROR, (errType, errDetail, errInfo) => {
+          if (isStale()) return;
           const infoObj = errInfo as { code?: number; msg?: string } | undefined;
-          const httpCode = infoObj?.code && infoObj.code >= 100 ? infoObj.code : undefined;
+          const httpCode =
+            infoObj?.code && infoObj.code >= 100 ? infoObj.code : undefined;
           if (httpCode) {
             recordHttp({
               urlRedacted: redactUrlCredentials(tsUrl),
@@ -1033,7 +1452,9 @@ export function HybridPlayer({
           }
           window.setTimeout(() => {
             void failOrAdvanceAttempt(
-              `Erro MPEG-TS (${String(errDetail || infoObj?.msg || 'Stream incompatível ou offline')})`,
+              `Erro MPEG-TS (${String(
+                errDetail || infoObj?.msg || 'Stream incompatível ou offline'
+              )})`,
               { httpStatus: httpCode }
             );
           }, 0);
@@ -1045,14 +1466,10 @@ export function HybridPlayer({
     };
 
     const initDirectNativeHtml5 = (mediaUrl: string, mediaType: DetectedMediaType) => {
-      if (cancelled || !videoRef.current) return;
+      if (isStale() || !videoRef.current) return;
 
-      // Never assume native support for AVI if browser explicitly says no
       if (mediaType === 'avi' && !codecCheck.canAttemptNative) {
-        patchDiagnostics((prev) => ({
-          ...prev,
-          engine: 'native-html5',
-        }));
+        setEngine('native-html5');
         void failOrAdvanceAttempt(
           'Arquivos .avi não possuem suporte nativo nos navegadores web modernos. Use MP4 (H.264/AAC) ou WebM.',
           { skipAdvance: true }
@@ -1065,9 +1482,10 @@ export function HybridPlayer({
       wireCommonVideoDiagnosticListeners();
 
       video.onerror = () => {
-        if (cancelled) return;
+        if (isStale()) return;
         const code = video.error?.code || 0;
-        const label = MEDIA_ERROR_LABELS[code] || (code ? `CODE_${code}` : 'UNKNOWN');
+        const label =
+          MEDIA_ERROR_LABELS[code] || (code ? `CODE_${code}` : 'UNKNOWN');
         const message = video.error?.message || '';
         const mediaErr = { code, label, message };
 
@@ -1079,7 +1497,9 @@ export function HybridPlayer({
 
         if (code === 3) {
           void failOrAdvanceAttempt(
-            `Erro de decodificação de codec/contêiner (${label}${message ? `: ${message}` : ''}).`,
+            `Erro de decodificação de codec/contêiner (${label}${
+              message ? `: ${message}` : ''
+            }).`,
             { mediaErr, skipAdvance: true }
           );
           return;
@@ -1088,115 +1508,19 @@ export function HybridPlayer({
         const unsupportedHint =
           mediaType === 'mkv' || mediaType === 'mov' || mediaType === 'avi'
             ? `Contêiner ${mediaType.toUpperCase()} ou codec incompatível com o navegador (${label}).`
-            : `Falha ao carregar vídeo nativo (${label}${message ? `: ${message}` : ''}).`;
+            : `Falha ao carregar vídeo nativo (${label}${
+                message ? `: ${message}` : ''
+              }).`;
 
         void failOrAdvanceAttempt(unsupportedHint, { mediaErr });
       };
 
-      // Native <video src={mediaUrl}> WITHOUT crossOrigin attribute so direct MP4/WebM ignores CORS
       setDirectVideoSrc(mediaUrl);
     };
 
     const start = async () => {
-      let activeType = initialMediaType;
-
-      // 1. Direct MP4 / WebM / MKV / MOV / AVI: NEVER route through HLS.js or Shaka Player!
-      if (
-        activeType === 'mp4' ||
-        activeType === 'webm' ||
-        activeType === 'mkv' ||
-        activeType === 'avi' ||
-        activeType === 'mov' ||
-        activeType === 'audio'
-      ) {
-        armLoadTimeout();
-        initDirectNativeHtml5(targetUrl, activeType);
-        return;
-      }
-
-      // 2. If M3U URL, check server-side/head whether it is an M3U playlist or HLS manifest before loading HLS.js
-      if (getCleanPath(url).endsWith('.m3u')) {
-        try {
-          const checkResp = await fetch(
-            `/api/check-stream?url=${encodeURIComponent(unwrapTargetUrl(targetUrl))}&timeoutMs=4500`,
-            { signal: abortController.signal }
-          );
-          if (cancelled) return;
-          if (checkResp.ok) {
-            const checkData = (await checkResp.json()) as {
-              ok?: boolean;
-              status?: number;
-              contentType?: string;
-              reason?: string;
-              detectedEngine?: string;
-            };
-            recordHttp({
-              urlRedacted: redactUrlCredentials(targetUrl),
-              status: checkData.status ?? 0,
-              contentType: checkData.contentType,
-              note: checkData.reason,
-            });
-            if (checkData.ok === false) {
-              void failOrAdvanceAttempt(
-                checkData.reason || 'URL M3U não é um manifesto HLS reproduzível.',
-                { skipAdvance: true, httpStatus: checkData.status }
-              );
-              return;
-            }
-            if (checkData.detectedEngine === 'hls') {
-              activeType = 'hls';
-            }
-          }
-        } catch (err) {
-          if (cancelled || (err as Error)?.name === 'AbortError') return;
-        }
-      }
-
-      // 3. Optional preflight for extensionless or live/mpegts URLs so exact media type & HTTP status are known
-      if (
-        enablePreflight &&
-        /^https?:\/\//i.test(unwrapTargetUrl(targetUrl)) &&
-        (activeType === 'unknown' || activeType === 'mpegts' || isLive)
-      ) {
-        try {
-          const rawCheckUrl = unwrapTargetUrl(targetUrl);
-          const checkResp = await fetch(
-            `/api/check-stream?url=${encodeURIComponent(rawCheckUrl)}&timeoutMs=4500`,
-            { signal: abortController.signal }
-          );
-          if (cancelled) return;
-          if (checkResp.ok) {
-            const checkData = (await checkResp.json()) as {
-              ok?: boolean;
-              status?: number;
-              contentType?: string;
-              reason?: string;
-              detectedEngine?: 'hls' | 'mpegts' | 'shaka' | 'native';
-            };
-            recordHttp({
-              urlRedacted: redactUrlCredentials(rawCheckUrl),
-              status: checkData.status ?? 0,
-              contentType: checkData.contentType,
-              note: checkData.reason,
-            });
-            if (checkData.ok === false) {
-              void failOrAdvanceAttempt(
-                checkData.reason || 'Stream indisponível no servidor de origem.',
-                { httpStatus: checkData.status }
-              );
-              return;
-            }
-            if (checkData.detectedEngine === 'hls') activeType = 'hls';
-            else if (checkData.detectedEngine === 'shaka') activeType = 'dash';
-            else if (checkData.detectedEngine === 'mpegts') activeType = 'mpegts';
-            else if (checkData.detectedEngine === 'native') activeType = 'mp4';
-          }
-        } catch (err) {
-          if (cancelled || (err as Error)?.name === 'AbortError') return;
-        }
-      }
-
-      if (cancelled) return;
+      const activeType = activeMediaType;
+      if (isStale()) return;
       armLoadTimeout();
 
       if (activeType === 'dash') {
@@ -1219,11 +1543,11 @@ export function HybridPlayer({
     };
   }, [
     url,
+    activeResolved,
     attempts,
     attemptIndex,
-    initialMediaType,
+    activeMediaType,
     isLive,
-    enablePreflight,
     streamProxyPrefix,
     autoProxyHttpStreams,
     destroyPlayers,
@@ -1256,9 +1580,6 @@ export function HybridPlayer({
       video.pause();
     }
   }, [isPlaying, isMuted, volume, isReady, patchDiagnostics]);
-
-  const lastHttp = diagnostics.httpStatuses[diagnostics.httpStatuses.length - 1];
-  const lastHlsErr = diagnostics.hlsErrors[diagnostics.hlsErrors.length - 1];
 
   return (
     <div className={`relative h-full w-full bg-black ${className}`}>
@@ -1340,115 +1661,12 @@ export function HybridPlayer({
         </div>
       )}
 
-      {/* Temporary Real Diagnostics Panel */}
       {showDiagnostics && (
-        <div
-          data-testid="player-diagnostics-panel"
-          className="absolute top-20 right-4 z-40 w-[340px] max-w-[calc(100vw-2rem)] rounded-xl border border-white/15 bg-[#0B0C0E]/92 text-[11px] text-white/90 shadow-2xl backdrop-blur-md"
-        >
-          <button
-            type="button"
-            onClick={() => setDiagExpanded((e) => !e)}
-            className="flex w-full items-center justify-between border-b border-white/10 px-3 py-2 font-semibold text-white"
-          >
-            <span className="inline-flex items-center gap-1.5">
-              <Activity className="h-3.5 w-3.5 text-[#E50914]" />
-              Diagnóstico Real do Player
-            </span>
-            {diagExpanded ? (
-              <ChevronUp className="h-3.5 w-3.5 text-white/60" />
-            ) : (
-              <ChevronDown className="h-3.5 w-3.5 text-white/60" />
-            )}
-          </button>
-
-          {diagExpanded && (
-            <div className="max-h-[60vh] space-y-1.5 overflow-y-auto p-3 font-mono text-[10.5px] leading-relaxed">
-              <div className="flex justify-between gap-2">
-                <span className="text-white/50">Tipo da mídia:</span>
-                <span className="font-semibold text-white">{diagnostics.mediaType}</span>
-              </div>
-              {diagnostics.codecSupportNote && (
-                <div className="text-[10px] text-white/60">
-                  Codec: {diagnostics.codecSupportNote}
-                </div>
-              )}
-              <div className="flex justify-between gap-2">
-                <span className="text-white/50">Engine escolhida:</span>
-                <span className="font-semibold text-emerald-400">
-                  {diagnostics.engine}
-                </span>
-              </div>
-              <div className="flex justify-between gap-2">
-                <span className="text-white/50">1º frame (TTFF):</span>
-                <span className="font-semibold text-white tabular-nums">
-                  {diagnostics.timeToFirstFrameMs !== null
-                    ? `${diagnostics.timeToFirstFrameMs} ms`
-                    : 'aguardando'}
-                </span>
-              </div>
-              <div className="border-t border-white/10 pt-1">
-                <p className="text-white/50">URL origem (credenciais ocultas):</p>
-                <p className="break-all text-white/85">
-                  {diagnostics.sourceUrlRedacted || '-'}
-                </p>
-                <p className="mt-1 text-white/50">URL final (credenciais ocultas):</p>
-                <p className="break-all text-sky-300">
-                  {diagnostics.finalUrlRedacted || '-'}
-                </p>
-              </div>
-              <div className="grid grid-cols-2 gap-1 border-t border-white/10 pt-1.5">
-                <span className={diagnostics.loadedmetadata.fired ? 'text-emerald-400' : 'text-white/45'}>
-                  loadedmetadata: {diagnostics.loadedmetadata.fired ? 'OK' : 'não'}
-                </span>
-                <span className={diagnostics.canplay.fired ? 'text-emerald-400' : 'text-white/45'}>
-                  canplay: {diagnostics.canplay.fired ? 'OK' : 'não'}
-                </span>
-                <span className={diagnostics.playing.fired ? 'text-emerald-400' : 'text-white/45'}>
-                  playing: {diagnostics.playing.fired ? 'OK' : 'não'}
-                </span>
-                <span className={diagnostics.stalled.count > 0 ? 'text-amber-400' : 'text-white/45'}>
-                  stalled: {diagnostics.stalled.count}x
-                </span>
-                <span className={diagnostics.errorEvent.fired ? 'text-rose-400' : 'text-white/45'}>
-                  error event: {diagnostics.errorEvent.fired ? 'SIM' : 'não'}
-                </span>
-                <span className="text-white/65">
-                  resolução:{' '}
-                  {diagnostics.loadedmetadata.width
-                    ? `${diagnostics.loadedmetadata.width}x${diagnostics.loadedmetadata.height}`
-                    : '-'}
-                </span>
-              </div>
-              {diagnostics.mediaError && (
-                <div className="rounded bg-rose-500/15 p-1.5 text-rose-300">
-                  MediaError: code={diagnostics.mediaError.code} ({diagnostics.mediaError.label})
-                  {diagnostics.mediaError.message ? ` — ${diagnostics.mediaError.message}` : ''}
-                </div>
-              )}
-              {diagnostics.playRejection && (
-                <div className="rounded bg-amber-500/15 p-1.5 text-amber-300">
-                  video.play() rejeitado: {diagnostics.playRejection.name} —{' '}
-                  {diagnostics.playRejection.message}
-                </div>
-              )}
-              {lastHttp && (
-                <div className="border-t border-white/10 pt-1 text-white/80">
-                  Último HTTP: <span className="font-bold">{lastHttp.status}</span>{' '}
-                  {lastHttp.contentType ? `(${lastHttp.contentType})` : ''}{' '}
-                  {lastHttp.note ? `· ${lastHttp.note}` : ''}
-                </div>
-              )}
-              {lastHlsErr && (
-                <div className="rounded bg-rose-500/15 p-1.5 text-rose-300">
-                  HLS.js: {lastHlsErr.type}/{lastHlsErr.details}{' '}
-                  {lastHlsErr.httpCode ? `HTTP ${lastHlsErr.httpCode}` : ''}{' '}
-                  {lastHlsErr.fatal ? '(FATAL)' : ''}
-                </div>
-              )}
-            </div>
-          )}
-        </div>
+        <PlayerDiagnosticsPanel
+          diagnostics={diagnostics}
+          isOpen={diagExpanded}
+          onToggle={() => setDiagExpanded((e) => !e)}
+        />
       )}
     </div>
   );
