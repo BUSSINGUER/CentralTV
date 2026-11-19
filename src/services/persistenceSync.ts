@@ -6,6 +6,7 @@ import {
 import { auth } from '../lib/firebase';
 import {
   CatalogItem,
+  MediaSource,
   M3uListRecord,
   ProcessingTaskScope,
   ProcessingTaskView,
@@ -17,6 +18,40 @@ let catalogCacheEpoch = 0;
 let localImportsInProgress = 0;
 const activeListUploads = new Set<string>();
 const CATALOG_BATCH_SIZE = 250;
+const MAX_SOURCES_PER_REQUEST = 500;
+const UPLOAD_REQUEST_TIMEOUT_MS = 75_000;
+
+export interface CatalogUploadProgress {
+  confirmed: number;
+  total: number;
+  sources: number;
+  needsCatalogRefresh?: boolean;
+}
+
+function sliceWorkForUpload(item: CatalogItem, listId: string, offset: number, limit: number) {
+  let skipped = offset;
+  let available = limit;
+  let remaining = false;
+  const takeSources = (sources: MediaSource[]) => sources.filter((source) => {
+    if (source.listId !== listId) return false;
+    if (skipped > 0) {
+      skipped--;
+      return false;
+    }
+    if (available === 0) {
+      remaining = true;
+      return false;
+    }
+    available--;
+    return true;
+  });
+  const sources = takeSources(item.sources || []);
+  const episodes = item.episodes?.flatMap((episode) => {
+    const selected = takeSources(episode.sources);
+    return selected.length > 0 ? [{ ...episode, sources: selected }] : [];
+  });
+  return { item: { ...item, sources, episodes }, remaining, sourceCount: limit - available };
+}
 
 export async function withLocalCatalogImport<T>(operation: () => Promise<T>): Promise<T> {
   localImportsInProgress++;
@@ -222,96 +257,89 @@ async function remapLocalIdsIfNeeded(
   }
 }
 
-export async function pullAuthoritativeStateFromServer(options?: {
-  replaceEmpty?: boolean;
-}): Promise<{
+interface CatalogPullResult {
   synced: boolean;
-  works: CatalogItem[];
+  workCount: number;
   lists: M3uListRecord[];
-  myListIds: string[];
-  watchHistory: WatchHistoryRecord[];
-}> {
+}
+
+let catalogPull: Promise<CatalogPullResult> | undefined;
+
+export function pullAuthoritativeStateFromServer(options?: { replaceEmpty?: boolean }): Promise<CatalogPullResult> {
+  if (options?.replaceEmpty) {
+    catalogCacheEpoch++;
+    return pullCatalogPages(true);
+  }
+  if (!catalogPull) {
+    catalogPull = pullCatalogPages(false).finally(() => { catalogPull = undefined; });
+  }
+  return catalogPull;
+}
+
+async function pullCatalogPages(replaceEmpty: boolean): Promise<CatalogPullResult> {
   const cacheEpoch = catalogCacheEpoch;
+  const unsynced = { synced: false, workCount: 0, lists: [] };
+  const canApply = () => cacheEpoch === catalogCacheEpoch && localImportsInProgress === 0;
+  if (!canApply() || await db.pendingCatalogImports.count()) return unsynced;
   const headers = await getBearerHeaders();
-  if (!headers) {
-    return {
-      synced: false,
-      works: [],
-      lists: [],
-      myListIds: [],
-      watchHistory: [],
-    };
-  }
+  if (!headers) return unsynced;
 
-  const [catResp, libResp, histResp] = await Promise.all([
-    fetch('/api/catalog?includeArchived=1', { headers }),
-    fetch('/api/user/library', { headers }),
-    fetch('/api/user/history', { headers }),
+  const fetchPage = (after?: string) => fetch(
+    `/api/catalog?includeArchived=1&page=1${after ? `&after=${encodeURIComponent(after)}` : ''}`,
+    { headers, signal: AbortSignal.timeout(60_000) }
+  );
+  const [firstPage, libResp, histResp] = await Promise.all([
+    fetchPage(),
+    fetch('/api/user/library', { headers, signal: AbortSignal.timeout(30_000) }),
+    fetch('/api/user/history', { headers, signal: AbortSignal.timeout(30_000) }),
   ]);
+  if (!firstPage.ok || !libResp.ok || !histResp.ok) return unsynced;
 
-  if (!catResp.ok || !libResp.ok || !histResp.ok) {
-    return {
-      synced: false,
-      works: [],
-      lists: [],
-      myListIds: [],
-      watchHistory: [],
-    };
-  }
-
-  const catData = (await catResp.json()) as {
-    works?: CatalogItem[];
-    lists?: M3uListRecord[];
-  };
   const libData = (await libResp.json()) as { myListIds?: string[] };
   const histData = (await histResp.json()) as { history?: WatchHistoryRecord[] };
+  const workIds = new Set<string>();
+  let after: string | undefined;
+  let response = firstPage;
+  let serverLists: M3uListRecord[] = [];
+  do {
+    const page = await readCatalogResponse<{ works: CatalogItem[]; lists?: M3uListRecord[]; nextAfter?: string }>(response);
+    if (!Array.isArray(page.works)) return unsynced;
+    if (!after) serverLists = page.lists || [];
+    const applied = await db.transaction('rw', db.mediaItems, db.pendingCatalogImports, async () => {
+      if (!canApply() || await db.pendingCatalogImports.count()) return false;
+      if (page.works.length) await db.mediaItems.bulkPut(page.works);
+      return true;
+    });
+    if (!applied) return unsynced;
+    for (const work of page.works) workIds.add(work.id);
+    if (page.nextAfter && after === page.nextAfter) return unsynced;
+    after = page.nextAfter;
+    if (after && canApply()) response = await fetchPage(after);
+    else if (after) return unsynced;
+  } while (after);
 
-  const serverWorks = catData.works || [];
-  const serverLists = catData.lists || [];
-  const serverMyList = libData.myListIds || [];
-  const serverHistory = histData.history || [];
-  const replaceEmpty = Boolean(options?.replaceEmpty);
-
-  await db.transaction(
-    'rw',
-    db.mediaItems,
-    db.m3u_lists,
-    db.userLibrary,
-    db.watchHistory,
-    db.pendingCatalogImports,
+  return db.transaction(
+    'rw', db.mediaItems, db.m3u_lists, db.userLibrary, db.watchHistory, db.pendingCatalogImports,
     async () => {
-      if (cacheEpoch !== catalogCacheEpoch) return;
-      // A partial server snapshot cannot replace data needed for a pending upload.
-      if (localImportsInProgress === 0 && (await db.pendingCatalogImports.count()) === 0) {
-        if (serverWorks.length > 0 || replaceEmpty) {
-          await db.mediaItems.clear();
-          if (serverWorks.length > 0) await db.mediaItems.bulkPut(serverWorks);
-        }
-        if (serverLists.length > 0 || serverWorks.length > 0 || replaceEmpty) {
-          await db.m3u_lists.clear();
-          if (serverLists.length > 0) await db.m3u_lists.bulkPut(serverLists);
-        }
+      if (!canApply() || await db.pendingCatalogImports.count()) return unsynced;
+      if (workIds.size > 0 || replaceEmpty) {
+        const localKeys = await db.mediaItems.toCollection().primaryKeys();
+        await db.mediaItems.bulkDelete(localKeys.filter((id) => !workIds.has(id)));
       }
-
-      if (serverMyList.length > 0 || serverWorks.length > 0 || replaceEmpty) {
-        await saveUserLibrary({ myListIds: serverMyList });
+      if (workIds.size > 0 || serverLists.length > 0 || replaceEmpty) {
+        await db.m3u_lists.clear();
+        await db.m3u_lists.bulkPut(serverLists);
       }
-      if (serverHistory.length > 0 || serverWorks.length > 0 || replaceEmpty) {
+      if (libData.myListIds?.length || workIds.size || replaceEmpty) {
+        await saveUserLibrary({ myListIds: libData.myListIds || [] });
+      }
+      if (histData.history?.length || workIds.size || replaceEmpty) {
         await db.watchHistory.clear();
-        if (serverHistory.length > 0) {
-          await db.watchHistory.bulkPut(serverHistory);
-        }
+        await db.watchHistory.bulkPut(histData.history || []);
       }
+      return { synced: true, workCount: workIds.size, lists: serverLists };
     }
   );
-
-  return {
-    synced: true,
-    works: serverWorks,
-    lists: serverLists,
-    myListIds: serverMyList,
-    watchHistory: serverHistory,
-  };
 }
 
 export async function runIndexedDbMigrationToServer(
@@ -323,7 +351,7 @@ export async function runIndexedDbMigrationToServer(
   if (source === 'indexeddb_auto') {
     if (localImportsInProgress || await db.pendingCatalogImports.count()) return null;
     const server = await pullAuthoritativeStateFromServer();
-    if (!server.synced || server.works.length > 0 || server.lists.length > 0) return null;
+    if (!server.synced || server.workCount > 0 || server.lists.length > 0) return null;
   }
   const snapshot = await createLocalBackupSnapshot();
 
@@ -368,46 +396,84 @@ export async function runIndexedDbMigrationToServer(
   return summary;
 }
 
-export async function resumeCatalogListUpload(list: M3uListRecord, signal?: AbortSignal) {
+export async function resumeCatalogListUpload(
+  list: M3uListRecord,
+  signal?: AbortSignal,
+  onProgress?: (progress: CatalogUploadProgress) => void
+) {
   if (activeListUploads.has(list.id)) throw new Error('Esta lista já está sincronizando.');
   activeListUploads.add(list.id);
   try {
     let pending = await db.pendingCatalogImports.get(list.id);
     if (!pending) return 0;
     const total = pending.itemIds.length;
+    const reportProgress = (record: NonNullable<typeof pending>) => onProgress?.({
+      confirmed: record.cursor,
+      total,
+      sources: record.confirmedSources || 0,
+      needsCatalogRefresh: record.needsCatalogRefresh,
+    });
+    reportProgress(pending);
+    if (total > 0 && pending.cursor >= total) {
+      await db.pendingCatalogImports.delete(list.id);
+      return total;
+    }
     do {
       signal?.throwIfAborted();
-      const end = Math.min(pending.cursor + CATALOG_BATCH_SIZE, total);
-      const rows = await db.mediaItems.bulkGet(pending.itemIds.slice(pending.cursor, end));
-      const items = rows.map((item) => {
-        if (!item) {
+      let cursor = pending.cursor;
+      let sourceOffset = pending.sourceOffset || 0;
+      let sourceCount = 0;
+      const items: CatalogItem[] = [];
+      const rows = await db.mediaItems.bulkGet(pending.itemIds.slice(cursor, cursor + CATALOG_BATCH_SIZE));
+      for (const row of rows) {
+        if (!row) {
           throw new Error('Há títulos ausentes na cópia local. Preserve o arquivo M3U para recuperar esta lista.');
         }
-        return {
-          ...item,
-          sources: item.sources?.filter((source) => source.listId === list.id),
-          episodes: item.episodes?.flatMap((episode) => {
-            const sources = episode.sources.filter((source) => source.listId === list.id);
-            return sources.length ? [{ ...episode, sources }] : [];
+        const piece = sliceWorkForUpload(row, list.id, sourceOffset, MAX_SOURCES_PER_REQUEST - sourceCount);
+        items.push(piece.item);
+        sourceCount += piece.sourceCount;
+        if (piece.remaining) {
+          sourceOffset += piece.sourceCount;
+          break;
+        }
+        cursor++;
+        sourceOffset = 0;
+        if (sourceCount >= MAX_SOURCES_PER_REQUEST) break;
+      }
+      const deadline = AbortSignal.timeout(UPLOAD_REQUEST_TIMEOUT_MS);
+      const requestSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+      let data: { idMap?: Record<string, string> };
+      try {
+        const response = await fetchWithAuthRetry('/api/catalog/sync', {
+          method: 'POST',
+          signal: requestSignal,
+          body: JSON.stringify({
+            items,
+            list: pending.cursor === 0 && !pending.sourceOffset ? list : undefined,
+            importListId: list.id,
+            mergeWithoutOverwrite: true,
           }),
-        };
-      });
-      const response = await fetchWithAuthRetry('/api/catalog/sync', {
-        method: 'POST',
-        signal,
-        body: JSON.stringify({
-          items,
-          list: pending.cursor === 0 ? list : undefined,
-          importListId: list.id,
-          mergeWithoutOverwrite: true,
-        }),
-      });
-      const data = await readCatalogResponse<{ idMap?: Record<string, string> }>(response);
-      if (data.idMap) await remapLocalIdsIfNeeded(data.idMap);
+        });
+        data = await readCatalogResponse(response);
+      } catch (error) {
+        if (deadline.aborted && !signal?.aborted) {
+          throw new Error('O servidor demorou para confirmar o lote. Retome o envio do último ponto salvo.');
+        }
+        throw error;
+      }
+      const remapped = Object.entries(data.idMap || {}).some(([id, canonical]) => id !== canonical);
+      if (remapped && data.idMap) await remapLocalIdsIfNeeded(data.idMap);
+      const confirmedSources = (pending.confirmedSources || 0) + sourceCount;
       await db.pendingCatalogImports.where('id').equals(list.id).modify((record) => {
-        record.cursor = Math.max(record.cursor, end);
+        if (record.cursor > cursor || (record.cursor === cursor && (record.sourceOffset || 0) > sourceOffset)) return;
+        record.cursor = cursor;
+        record.sourceOffset = sourceOffset;
+        record.confirmedSources = Math.max(record.confirmedSources || 0, confirmedSources);
+        if (remapped) record.needsCatalogRefresh = true;
       });
       pending = await db.pendingCatalogImports.get(list.id);
+      if (!pending) throw new Error('O envio foi encerrado em outra aba.');
+      reportProgress(pending);
     } while (pending && pending.cursor < total);
     await db.pendingCatalogImports.delete(list.id);
     return total;

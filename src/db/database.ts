@@ -13,6 +13,9 @@ export interface PendingCatalogImport {
   id: string;
   itemIds: string[];
   cursor: number;
+  sourceOffset?: number;
+  confirmedSources?: number;
+  needsCatalogRefresh?: boolean;
 }
 
 class AuraStreamDatabase extends Dexie {

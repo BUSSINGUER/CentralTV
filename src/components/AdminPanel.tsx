@@ -64,6 +64,7 @@ import {
   restoreLocalBackupSnapshot,
   resumeProcessingTask,
   resumeCatalogListUpload,
+  type CatalogUploadProgress,
   rollbackServerMigration,
   runIndexedDbMigrationToServer,
   ServerMigrationBackupItem,
@@ -303,6 +304,8 @@ export function AdminPanel({
   const [showXtreamPassword, setShowXtreamPassword] = useState(false);
   const [listCustomName, setListCustomName] = useState('');
   const [importing, setImporting] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<CatalogUploadProgress | null>(null);
+  const refreshAfterUploadRef = useRef(false);
   const [importStats, setImportStats] = useState<M3UImportStats | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
   const [importResultMsg, setImportResultMsg] = useState<string | null>(null);
@@ -368,13 +371,12 @@ export function AdminPanel({
   const [youtubeLocked, setYoutubeLocked] = useState(true);
   const [settingsSavedMsg, setSettingsSavedMsg] = useState(false);
 
-  const refreshItems = useCallback(async () => {
+  const refreshItems = useCallback(async (notifyCatalog = true) => {
     try {
-      const [all, epg, lists, backups, pendingIds] = await Promise.all([
+      const [all, epg, lists, pendingIds] = await Promise.all([
         db.mediaItems.orderBy('createdAt').reverse().toArray(),
         getAllEpgPrograms(),
         getAllM3uLists(),
-        user ? fetchMigrationBackups() : Promise.resolve([]),
         db.pendingCatalogImports.toArray(),
       ]);
       setItems(all.filter((it) => !it.archived));
@@ -384,14 +386,13 @@ export function AdminPanel({
       setPendingListProgress(Object.fromEntries(pendingIds.map((job) => [
         job.id, { confirmed: job.cursor, total: job.itemIds.length },
       ])));
-      setMigrationBackups(backups);
-      onCatalogChanged();
+      if (notifyCatalog) onCatalogChanged();
     } catch (err) {
       console.error('Failed to refresh admin items:', err);
     } finally {
       setLoadingDb(false);
     }
-  }, [user, onCatalogChanged]);
+  }, [onCatalogChanged]);
 
   const applyServerTasksSnapshot = useCallback(
     async (tasks: ProcessingTaskView[]) => {
@@ -462,12 +463,15 @@ export function AdminPanel({
   useEffect(() => {
     let active = true;
     const bootstrap = async () => {
-      if (user) {
-        await pullAuthoritativeStateFromServer().catch(() => {});
-      }
-      if (!active) return;
       await refreshItems();
-      if (user && active) {
+      if (!active) return;
+      if (user) {
+        void pullAuthoritativeStateFromServer().then((result) => {
+          if (active && result.synced) return refreshItems();
+        }).catch(() => {});
+        void fetchMigrationBackups().then((backups) => {
+          if (active) setMigrationBackups(backups);
+        }).catch(() => {});
         await syncTasksFromServer();
       }
     };
@@ -584,6 +588,28 @@ export function AdminPanel({
   }, [statusFilter, kindFilter, searchTerm]);
 
   // M3U / JSON / Xtream Handlers
+  const trackImportUpload = () => {
+    let started = false;
+    refreshAfterUploadRef.current = false;
+    return (progress: CatalogUploadProgress) => {
+      setUploadProgress(progress);
+      refreshAfterUploadRef.current = Boolean(progress.needsCatalogRefresh);
+      if (!started) {
+        started = true;
+        void refreshItems(false);
+      }
+    };
+  };
+
+  const refreshImportedCatalog = async (syncError?: string) => {
+    await refreshItems();
+    if (!syncError && refreshAfterUploadRef.current) {
+      void pullAuthoritativeStateFromServer().then((result) => {
+        if (result.synced) return refreshItems();
+      }).catch(() => {});
+    }
+  };
+
   const formatMergeSummary = (result: M3UImportStats) => {
     if (result.syncError) {
       return `Arquivo lido, envio incompleto: ${result.syncError} Use “Retomar envio” em Listas.`;
@@ -595,6 +621,8 @@ export function AdminPanel({
 
   const handleFileImport = async (file: File, stayOnLists = false) => {
     setImporting(true);
+    setUploadProgress(null);
+    setImportStats(null);
     setImportError(null);
     setImportResultMsg(null);
     setListActionMsg(null);
@@ -606,13 +634,14 @@ export function AdminPanel({
         customName: listCustomName.trim() || undefined,
         signal: controller.signal,
         onProgress: (stats) => setImportStats(stats),
+        onUploadProgress: trackImportUpload(),
       });
       setImportStats(result);
       const summary = formatMergeSummary(result);
       setImportResultMsg(summary);
       if (stayOnLists) setListActionMsg(summary);
       setListCustomName('');
-      await refreshItems();
+      await refreshImportedCatalog(result.syncError);
       if (!stayOnLists) setActiveTab('queue');
     } catch (err) {
       if ((err as Error)?.name !== 'AbortError') {
@@ -630,6 +659,8 @@ export function AdminPanel({
     e.preventDefault();
     if (!m3uUrl.trim()) return;
     setImporting(true);
+    setUploadProgress(null);
+    setImportStats(null);
     setImportError(null);
     setImportResultMsg(null);
     setListActionMsg(null);
@@ -641,6 +672,7 @@ export function AdminPanel({
         customName: listCustomName.trim() || undefined,
         signal: controller.signal,
         onProgress: (stats) => setImportStats(stats),
+        onUploadProgress: trackImportUpload(),
       });
       setImportStats(result);
       const summary = formatMergeSummary(result);
@@ -648,7 +680,7 @@ export function AdminPanel({
       if (stayOnLists) setListActionMsg(summary);
       setM3uUrl('');
       setListCustomName('');
-      await refreshItems();
+      await refreshImportedCatalog(result.syncError);
       if (!stayOnLists) setActiveTab('queue');
     } catch (err) {
       if ((err as Error)?.name !== 'AbortError') {
@@ -672,6 +704,8 @@ export function AdminPanel({
       return;
     }
     setImporting(true);
+    setUploadProgress(null);
+    setImportStats(null);
     setImportError(null);
     setImportResultMsg(null);
     setListActionMsg(null);
@@ -689,6 +723,7 @@ export function AdminPanel({
           customName: listCustomName.trim() || undefined,
           signal: controller.signal,
           onProgress: (stats) => setImportStats(stats),
+          onUploadProgress: trackImportUpload(),
         }
       );
       setImportStats(result);
@@ -699,7 +734,7 @@ export function AdminPanel({
       setXtreamUsername('');
       setXtreamPassword('');
       setListCustomName('');
-      await refreshItems();
+      await refreshImportedCatalog(result.syncError);
       if (!stayOnLists) setActiveTab('queue');
     } catch (err) {
       if ((err as Error)?.name !== 'AbortError') {
@@ -717,20 +752,26 @@ export function AdminPanel({
 
   const handleSampleImport = async (stayOnLists = false) => {
     setImporting(true);
+    setUploadProgress(null);
+    setImportStats(null);
     setImportError(null);
     setImportResultMsg(null);
     setListActionMsg(null);
+    const controller = new AbortController();
+    importAbortRef.current = controller;
     try {
       const result = await importM3UFromText(SAMPLE_M3U_SNIPPET, {
         customName: listCustomName.trim() || undefined,
+        signal: controller.signal,
         onProgress: (stats) => setImportStats(stats),
+        onUploadProgress: trackImportUpload(),
       });
       setImportStats(result);
       const summary = formatMergeSummary(result);
       setImportResultMsg(summary);
       if (stayOnLists) setListActionMsg(summary);
       setListCustomName('');
-      await refreshItems();
+      await refreshImportedCatalog(result.syncError);
       if (!stayOnLists) setActiveTab('queue');
     } catch (err) {
       setImportError(
@@ -738,33 +779,41 @@ export function AdminPanel({
       );
     } finally {
       setImporting(false);
+      importAbortRef.current = null;
     }
   };
 
   const handleResyncM3uList = async (list: M3uListRecord) => {
     setResyncingListId(list.id);
+    setUploadProgress(null);
+    setImportStats(null);
     setImportError(null);
     setListActionMsg(null);
+    const controller = new AbortController();
+    importAbortRef.current = controller;
     try {
       if (pendingListIds.includes(list.id)) {
-        const total = await resumeCatalogListUpload(list);
-        await pullAuthoritativeStateFromServer().catch(() => {});
-        await refreshItems();
+        const total = await resumeCatalogListUpload(list, controller.signal, trackImportUpload());
+        await refreshImportedCatalog();
         setListActionMsg(`Envio de "${list.name}" concluído. ${total} títulos confirmados pelo servidor.`);
         return;
       }
       const result = await resyncM3uList(list, {
+        signal: controller.signal,
         onProgress: (stats) => setImportStats(stats),
+        onUploadProgress: trackImportUpload(),
       });
-      await refreshItems();
+      await refreshImportedCatalog(result.syncError);
       setListActionMsg(formatMergeSummary(result));
     } catch (err) {
       await refreshItems();
-      setImportError(
-        err instanceof Error ? err.message : 'Falha ao re-sincronizar lista.'
-      );
+      const message = controller.signal.aborted
+        ? 'Envio interrompido. Use “Retomar envio” para continuar.'
+        : err instanceof Error ? err.message : 'Falha ao re-sincronizar lista.';
+      setListActionMsg(message);
     } finally {
       setResyncingListId(null);
+      importAbortRef.current = null;
     }
   };
 
@@ -1460,7 +1509,7 @@ export function AdminPanel({
           <div className="flex items-center justify-between text-xs font-semibold">
             <span className="text-white">
               {importing
-                ? 'Processando fonte e aplicando mesclagem inteligente...'
+                ? uploadProgress ? 'Enviando títulos e fontes ao servidor…' : 'Lendo e agrupando entradas…'
                 : importStats?.detectedFormat === 'json'
                   ? 'Catálogo JSON processado e salvo no IndexedDB'
                   : 'Lista M3U processada e salva no IndexedDB'}
@@ -1471,7 +1520,7 @@ export function AdminPanel({
                 onClick={() => importAbortRef.current?.abort()}
                 className="text-rose-400 hover:underline"
               >
-                Cancelar
+                {uploadProgress ? 'Interromper envio' : 'Cancelar leitura'}
               </button>
             )}
           </div>
@@ -1483,7 +1532,9 @@ export function AdminPanel({
                   className="h-full bg-[#E50914] transition-all duration-150"
                   style={{
                     width: `${
-                      importStats.totalBytes > 0
+                      importing && uploadProgress
+                        ? Math.round(100 * uploadProgress.confirmed / Math.max(1, uploadProgress.total))
+                        : importStats.totalBytes > 0
                         ? Math.min(
                             100,
                             Math.round(
@@ -1669,12 +1720,36 @@ export function AdminPanel({
       </div>
 
       {/* TAB 1: PRE-PUBLICATION QUEUE & PIPELINE */}
+      {(importing || resyncingListId) && uploadProgress && (
+        <div className="mb-6 rounded-lg border border-white/15 bg-[#121417] px-4 py-3 text-sm text-white">
+          <div role="status">
+            <p>Enviando ao servidor · {uploadProgress.confirmed.toLocaleString('pt-BR')} de {uploadProgress.total.toLocaleString('pt-BR')} títulos confirmados</p>
+            <p className="mt-1 text-xs text-white/70">
+              {uploadProgress.sources.toLocaleString('pt-BR')} fontes confirmadas nesta importação.
+              A verificação e a publicação ficam disponíveis após o envio.
+            </p>
+          </div>
+          {(activeTab === 'queue' || Boolean(resyncingListId)) && (
+            <button type="button" onClick={() => importAbortRef.current?.abort()} className="mt-2 text-xs text-rose-300 hover:underline">
+              Interromper envio
+            </button>
+          )}
+        </div>
+      )}
       {activeTab === 'queue' && (
         <div className="space-y-6">
+          {pendingListIds.length > 0 && !importing && !resyncingListId && (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+              <p>Há listas com envio pendente. Retome o envio para liberar a verificação.</p>
+              <button type="button" onClick={() => setActiveTab('lists')} className="font-semibold underline">
+                Abrir Listas
+              </button>
+            </div>
+          )}
           {/* Summary Stats */}
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
             <div className="rounded-xl border border-white/10 bg-[#121417] p-4">
-              <p className="text-xs text-white/55">Total Importado</p>
+              <p className="text-xs text-white/55">Títulos no catálogo local</p>
               <p className="mt-1 font-display text-2xl font-bold text-white tabular-nums">
                 {counts.total}
               </p>

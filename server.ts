@@ -2289,14 +2289,22 @@ export async function createServer(httpServer?: http.Server) {
       const includeArchived =
         req.query.includeArchived === '1' || req.query.includeArchived === 'true';
       const statusParam = req.query.status as PublishStatus | undefined;
+      const page = req.query.page === '1'
+        ? { after: typeof req.query.after === 'string' ? req.query.after : undefined, limit: 100 }
+        : undefined;
       const [worksList, listsRows] = await Promise.all([
         listWorksFromPostgres({
           includeArchived,
           status: statusParam,
+          page,
         }),
-        listListsFromPostgres(),
+        page?.after ? Promise.resolve([]) : listListsFromPostgres(),
       ]);
-      res.json({ works: worksList, lists: listsRows });
+      res.json({
+        works: worksList,
+        lists: listsRows,
+        nextAfter: page && worksList.length === page.limit ? worksList.at(-1)?.id : undefined,
+      });
     } catch (error) {
       console.error('GET /api/catalog failed:', error);
       res.status(500).json({

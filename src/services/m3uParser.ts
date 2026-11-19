@@ -5,10 +5,10 @@ import {
 } from './streamOrigins';
 import {
   deleteListOnServer,
-  pullAuthoritativeStateFromServer,
   resumeCatalogListUpload,
   syncCatalogItemsToServer,
   withLocalCatalogImport,
+  type CatalogUploadProgress,
 } from './persistenceSync';
 import {
   buildProvisionalKey,
@@ -46,15 +46,8 @@ export interface M3UImportOptions {
   customName?: string;
   xtreamCredentials?: XtreamCredentials;
   onProgress?: (stats: M3UImportStats) => void;
+  onUploadProgress?: (progress: CatalogUploadProgress) => void;
   signal?: AbortSignal;
-}
-
-async function importAndRefreshCatalog(operation: () => Promise<M3UImportStats>) {
-  const result = await withLocalCatalogImport(operation);
-  if (!result.syncError) {
-    await pullAuthoritativeStateFromServer().catch(() => {});
-  }
-  return result;
 }
 
 interface ParsedExtInf {
@@ -826,7 +819,7 @@ export async function importM3UFromStream(
   await flushBatch();
   stats.touchedItemIds = Array.from(touchedIdSet);
   if (discoveredOrigins.size > 0) {
-    await authorizeStreamOrigins(Array.from(discoveredOrigins));
+    void authorizeStreamOrigins(Array.from(discoveredOrigins));
   }
   options.onProgress?.({ ...stats, byKind: { ...stats.byKind } });
   return stats;
@@ -1157,7 +1150,7 @@ async function persistListSummary(
   sourceType: M3uListRecord['sourceType'],
   sourceLocation?: string,
   xtreamCredentials?: XtreamCredentials,
-  signal?: AbortSignal
+  options?: M3UImportOptions
 ) {
   const record: M3uListRecord = {
     id: stats.listId,
@@ -1176,7 +1169,7 @@ async function persistListSummary(
     await db.pendingCatalogImports.put({ id: record.id, itemIds: stats.touchedItemIds || [], cursor: 0 });
   });
   try {
-    await resumeCatalogListUpload(record, signal);
+    await resumeCatalogListUpload(record, options?.signal, options?.onUploadProgress);
   } catch (error) {
     stats.syncError = error instanceof Error && error.name !== 'AbortError'
       ? error.message
@@ -1754,7 +1747,7 @@ export async function importM3UFromFile(
   file: File,
   options: M3UImportOptions = {}
 ): Promise<M3UImportStats> {
-  return importAndRefreshCatalog(() => importM3UFile(file, options));
+  return withLocalCatalogImport(() => importM3UFile(file, options));
 }
 
 async function importM3UFile(
@@ -1793,7 +1786,7 @@ async function importM3UFile(
     stats,
     options.customName?.trim() || file.name,
     'file',
-    file.name, undefined, options.signal
+    file.name, undefined, options
   );
   return stats;
 }
@@ -1802,7 +1795,7 @@ export async function importM3UFromText(
   text: string,
   options: M3UImportOptions = {}
 ): Promise<M3UImportStats> {
-  return importAndRefreshCatalog(() => importM3UText(text, options));
+  return withLocalCatalogImport(() => importM3UText(text, options));
 }
 
 async function importM3UText(
@@ -1825,7 +1818,7 @@ async function importM3UText(
   await persistListSummary(
     stats,
     options.customName?.trim() || 'Lista Exemplo M3U',
-    'sample', undefined, undefined, options.signal
+    'sample', undefined, undefined, options
   );
   return stats;
 }
@@ -1834,7 +1827,7 @@ export async function importM3UFromUrl(
   url: string,
   options: M3UImportOptions = {}
 ): Promise<M3UImportStats> {
-  return importAndRefreshCatalog(() => importM3UUrl(url, options));
+  return withLocalCatalogImport(() => importM3UUrl(url, options));
 }
 
 async function importM3UUrl(
@@ -1945,7 +1938,7 @@ async function importM3UUrl(
       stats,
       options.customName?.trim() || `${buildServerDisplayName(cleanUrl)} (JSON)`,
       'json',
-      cleanUrl, undefined, options.signal
+      cleanUrl, undefined, options
     );
     return stats;
   }
@@ -2003,7 +1996,7 @@ async function importM3UUrl(
     isXtream ? 'xtream' : 'url',
     locationToSave,
     options.xtreamCredentials,
-    options.signal
+    options
   );
   return stats;
 }

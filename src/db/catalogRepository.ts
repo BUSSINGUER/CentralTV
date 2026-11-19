@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { and, desc, eq, inArray, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, inArray, sql } from 'drizzle-orm';
 import type {
   CatalogItem,
   MediaFormatBadge,
@@ -331,18 +331,20 @@ function hydrateCatalogItem(
 export async function listWorksFromPostgres(options?: {
   includeArchived?: boolean;
   status?: PublishStatus;
+  page?: { after?: string; limit: number };
 }): Promise<CatalogItem[]> {
   try {
-    const workRows = await pgDb
+    const page = options?.page;
+    const query = pgDb
       .select()
       .from(works)
-      .orderBy(desc(works.createdAt));
-
-    const filteredWorks = workRows.filter((w) => {
-      if (!options?.includeArchived && w.archived) return false;
-      if (options?.status && w.status !== options.status) return false;
-      return true;
-    });
+      .where(and(
+        options?.includeArchived ? undefined : eq(works.archived, false),
+        options?.status ? eq(works.status, options.status) : undefined,
+        page?.after ? gt(works.id, page.after) : undefined
+      ))
+      .orderBy(page ? asc(works.id) : desc(works.createdAt));
+    const filteredWorks = await (page ? query.limit(page.limit) : query);
 
     if (filteredWorks.length === 0) return [];
 
@@ -352,28 +354,19 @@ export async function listWorksFromPostgres(options?: {
       pgDb
         .select()
         .from(workMetadata)
-        .where(inArray(workMetadata.workId, workIds)),
+        .where(sql`${workMetadata.workId} = any(${sql.param(workIds)}::text[])`),
       pgDb
         .select()
         .from(episodes)
-        .where(inArray(episodes.workId, workIds)),
+        .where(sql`${episodes.workId} = any(${sql.param(workIds)}::text[])`),
       pgDb
-        .select()
+        .select({ source: sources, availability: sourceAvailability })
         .from(sources)
-        .where(inArray(sources.workId, workIds)),
+        .leftJoin(sourceAvailability, eq(sourceAvailability.sourceId, sources.id))
+        .where(sql`${sources.workId} = any(${sql.param(workIds)}::text[])`),
     ]);
 
-    const srcIds = srcRows.map((s) => s.id);
-    const availRows =
-      srcIds.length > 0
-        ? await pgDb
-            .select()
-            .from(sourceAvailability)
-            .where(inArray(sourceAvailability.sourceId, srcIds))
-        : [];
-
     const metaByWork = new Map(metaRows.map((m) => [m.workId, m]));
-    const availBySrc = new Map(availRows.map((a) => [a.sourceId, a]));
 
     const workSourcesMap = new Map<
       string,
@@ -390,8 +383,8 @@ export async function listWorksFromPostgres(options?: {
       }>
     >();
 
-    for (const s of srcRows) {
-      const bundle = { source: s, availability: availBySrc.get(s.id) };
+    for (const { source: s, availability } of srcRows) {
+      const bundle = { source: s, availability: availability ?? undefined };
       if (s.episodeId) {
         const list = epSourcesMap.get(s.episodeId) || [];
         list.push(bundle);
@@ -709,6 +702,131 @@ export interface UpsertWorkResult {
   reactivated: boolean;
 }
 
+type ListUploadContext = {
+  listId: string;
+  serverIds: Map<string, string | null>;
+};
+
+// Large list uploads use batched writes. Other catalog writers still keep their
+// per-source update and rollback behavior.
+async function addUploadedListSources(
+  tx: DbExecutor,
+  workId: string,
+  item: CatalogItem,
+  context: ListUploadContext,
+  now: number
+) {
+  const incomingEpisodes = item.type === 'series' ? item.episodes || [] : [];
+  const links = (item.sources || []).map((src, index) => ({
+    src, index, episodeId: null as string | null,
+  }));
+  if (incomingEpisodes.length) {
+    const existingSeasons = await tx.select().from(seasons).where(eq(seasons.workId, workId));
+    const seasonIds = new Map(existingSeasons.map((season) => [season.seasonNumber, season.id]));
+    const newSeasons: Array<typeof seasons.$inferInsert> = [];
+    for (const episode of incomingEpisodes) {
+      const seasonNumber = episode.season || 1;
+      if (seasonIds.has(seasonNumber)) continue;
+      const id = `${workId}::S${seasonNumber}`;
+      seasonIds.set(seasonNumber, id);
+      newSeasons.push({ id, workId, seasonNumber, title: `Temporada ${seasonNumber}`, createdAt: now });
+    }
+    if (newSeasons.length) await tx.insert(seasons).values(newSeasons);
+
+    const existingEpisodes = await tx.select({
+      id: episodes.id, seasonNumber: episodes.seasonNumber, episodeNumber: episodes.episodeNumber,
+    }).from(episodes).where(eq(episodes.workId, workId));
+    const episodeKey = (season: number, episode: number) => `${season}:${episode}`;
+    const episodeIds = new Map(existingEpisodes.map((episode) => [
+      episodeKey(episode.seasonNumber, episode.episodeNumber), episode.id,
+    ]));
+    const newEpisodes: Array<typeof episodes.$inferInsert> = [];
+    for (const episode of incomingEpisodes) {
+      const seasonNumber = episode.season || 1;
+      const key = episodeKey(seasonNumber, episode.episode);
+      let id = episodeIds.get(key);
+      if (!id) {
+        id = `${workId}::S${seasonNumber}::E${episode.episode}`;
+        episodeIds.set(key, id);
+        newEpisodes.push({
+          id, workId, seasonId: seasonIds.get(seasonNumber)!,
+          seasonNumber, episodeNumber: episode.episode,
+          externalEpisodeId: episode.id || `s${seasonNumber}e${episode.episode}`,
+          title: episode.title, duration: episode.duration ?? null,
+          synopsis: episode.synopsis ?? null, createdAt: now, updatedAt: now,
+        });
+      }
+      for (const [index, src] of episode.sources.entries()) links.push({ src, index, episodeId: id });
+    }
+    if (newEpisodes.length) await tx.insert(episodes).values(newEpisodes);
+  }
+  if (links.length === 0) return;
+
+  const existingLinks = await tx.select().from(sources).where(and(
+    eq(sources.workId, workId),
+    inArray(sources.url, [...new Set(links.map(({ src }) => src.url))])
+  ));
+  const sourceKey = (episodeId: string | null, url: string) => JSON.stringify([episodeId, url]);
+  const existingByKey = new Map<string, typeof sources.$inferSelect>();
+  for (const source of existingLinks) {
+    const key = sourceKey(source.episodeId, source.url);
+    if (source.listId === context.listId || (source.listId === null && !existingByKey.has(key))) {
+      existingByKey.set(key, source);
+    }
+  }
+  const sourceRows = new Map<string, typeof sources.$inferInsert>();
+  const availabilityRows = new Map<string, typeof sourceAvailability.$inferInsert>();
+  const sourceIds = [...new Set(links.map(({ src }) => src.id).filter(Boolean))];
+  const usedIds = new Set(sourceIds.length ? (await tx.select({ id: sources.id }).from(sources)
+    .where(inArray(sources.id, sourceIds))).map(({ id }) => id) : []);
+  const newIdsByKey = new Map<string, string>();
+  for (const { src, episodeId, index } of links) {
+    const key = sourceKey(episodeId, src.url);
+    const existing = existingByKey.get(key);
+    let id = existing?.id || newIdsByKey.get(key);
+    if (!id) {
+      id = src.id && !usedIds.has(src.id) ? src.id : `src-list-${crypto.createHash('sha256')
+        .update(JSON.stringify([context.listId, workId, key])).digest('hex').slice(0, 32)}`;
+      newIdsByKey.set(key, id);
+      usedIds.add(id);
+    }
+    const origin = extractServerOrigin(src.url)?.baseUrl;
+    if (origin && !context.serverIds.has(origin)) {
+      context.serverIds.set(origin, await ensureServer(tx, src.url, 'cdn', now));
+    }
+    sourceRows.set(id, {
+      id, workId, episodeId, listId: context.listId, url: src.url, label: src.label,
+      serverId: (origin && context.serverIds.get(origin)) || existing?.serverId || null,
+      qualityTag: src.qualityTag ?? existing?.qualityTag ?? null,
+      resolutionTag: src.resolutionTag ?? existing?.resolutionTag ?? null,
+      languageTag: src.languageTag ?? existing?.languageTag ?? null,
+      originalName: existing?.originalName ?? src.originalName ?? null,
+      resolvedUrl: src.resolvedUrl ?? existing?.resolvedUrl ?? null,
+      detectedFormat: src.detectedFormat ?? existing?.detectedFormat ?? null,
+      groupTitle: existing?.groupTitle ?? src.groupTitle ?? null,
+      tvgId: existing?.tvgId ?? src.tvgId ?? null,
+      priorityOrder: index, createdAt: existing?.createdAt ?? now, updatedAt: now,
+    });
+    availabilityRows.set(id, {
+      sourceId: id, status: src.status || 'pending',
+      validationState: src.validationState || 'unverified', httpStatus: src.httpStatus ?? null,
+      latencyMs: src.latencyMs ?? null, reason: src.reason ?? null,
+      lastCheckedAt: src.lastCheckedAt ?? null, updatedAt: now,
+    });
+  }
+  await tx.insert(sources).values([...sourceRows.values()]).onConflictDoUpdate({
+    target: sources.id,
+    set: {
+      listId: context.listId, serverId: sql`excluded.server_id`, label: sql`excluded.label`,
+      qualityTag: sql`excluded.quality_tag`, resolutionTag: sql`excluded.resolution_tag`,
+      languageTag: sql`excluded.language_tag`, resolvedUrl: sql`excluded.resolved_url`,
+      detectedFormat: sql`excluded.detected_format`, priorityOrder: sql`excluded.priority_order`,
+      updatedAt: now,
+    },
+  });
+  await tx.insert(sourceAvailability).values([...availabilityRows.values()]).onConflictDoNothing();
+}
+
 export async function upsertWorkInsideTx(
   tx: DbExecutor,
   incoming: CatalogItem,
@@ -721,6 +839,7 @@ export async function upsertWorkInsideTx(
     createdEpisodeIds?: string[];
     createdSourceIds?: string[];
     createdServerIds?: string[];
+    listUpload?: ListUploadContext;
   }
 ): Promise<UpsertWorkResult> {
   const {
@@ -732,6 +851,7 @@ export async function upsertWorkInsideTx(
     createdEpisodeIds,
     createdSourceIds,
     createdServerIds,
+    listUpload,
   } = options;
 
   const existingWork = await resolveCanonicalWork(tx, incoming);
@@ -799,6 +919,10 @@ export async function upsertWorkInsideTx(
       updatedAt: incoming.updatedAt || now,
     });
 
+    if (listUpload) {
+      await addUploadedListSources(tx, workId, incoming, listUpload, now);
+      return { workId, created: true, reactivated: false };
+    }
     const sortedRootSources = sortAndRelabelSourcesList(incoming.sources || []);
     for (let i = 0; i < sortedRootSources.length; i++) {
       await upsertSourceRow(tx, {
@@ -981,6 +1105,10 @@ export async function upsertWorkInsideTx(
       .where(eq(workMetadata.workId, workId));
   }
 
+  if (listUpload) {
+    await addUploadedListSources(tx, workId, incoming, listUpload, now);
+    return { workId, created: false, reactivated: wasArchived && hasIncomingSources };
+  }
   const sortedRootSources = sortAndRelabelSourcesList(incoming.sources || []);
   for (let i = 0; i < sortedRootSources.length; i++) {
     await upsertSourceRow(tx, {
@@ -1099,11 +1227,15 @@ export async function syncCatalogBatchToPostgres(params: {
         if (!list) throw new CatalogConflictError('A lista foi removida. Inicie uma nova importação com o arquivo original.');
       }
 
+      const listUpload = params.importListId && params.mergeWithoutOverwrite
+        ? { listId: params.importListId, serverIds: new Map<string, string | null>() }
+        : undefined;
       for (const item of params.items) {
         const res = await upsertWorkInsideTx(tx, item, {
           mergeWithoutOverwrite: Boolean(params.mergeWithoutOverwrite),
           preserveAvailability: Boolean(params.mergeWithoutOverwrite),
           now,
+          listUpload,
         });
         if (item.id) idMap[item.id] = res.workId;
         if (res.created) createdCount += 1;
