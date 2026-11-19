@@ -2907,8 +2907,10 @@ export async function createServer(httpServer?: http.Server) {
       server: {
         middlewareMode: true,
         allowedHosts: ['localhost', '127.0.0.1', '.run.app'],
-        hmr: false,
-        ws: false,
+        // Use the same HTTP server for Vite's websocket. Disabling the socket
+        // while still serving /@vite/client makes the preview emit an
+        // unhandled "WebSocket closed without opened" rejection.
+        hmr: httpServer ? { server: httpServer } : true,
       },
       appType: 'spa',
     });

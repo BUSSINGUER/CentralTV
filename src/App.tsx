@@ -111,11 +111,11 @@ export default function App() {
   const migratedUidRef = useRef<string | null>(null);
 
   const loadPublishedCatalog = useCallback(async () => {
-    const published = (
-      await db.mediaItems.where('status').equals('publicado').toArray()
-    ).filter((item) => !item.archived);
-    setPublishedDbItems(published);
-    void authorizeStreamOrigins(extractUrlsFromCatalogItems(published));
+    const visible = (await db.mediaItems.toArray()).filter(
+      (item) => !item.archived && item.status !== 'offline'
+    );
+    setPublishedDbItems(visible);
+    void authorizeStreamOrigins(extractUrlsFromCatalogItems(visible));
   }, []);
 
   const loadEpg = useCallback(async () => {
@@ -130,12 +130,14 @@ export default function App() {
         await Promise.all([
           getSettings(),
           getUserLibrary(),
-          db.mediaItems.where('status').equals('publicado').toArray(),
+          db.mediaItems.toArray(),
           getAllEpgPrograms(),
           getAllWatchHistory(),
         ]);
       if (!mounted) return;
-      const published = publishedRaw.filter((item) => !item.archived);
+      const published = publishedRaw.filter(
+        (item) => !item.archived && item.status !== 'offline'
+      );
       setSettings(loadedSettings);
       setMyListIds(loadedLibrary.myListIds);
       setLegacyContinueWatching(loadedLibrary.continueWatching);
@@ -174,11 +176,13 @@ export default function App() {
         await runIndexedDbMigrationToServer('indexeddb_auto');
         const [loadedLibrary, publishedRaw, history] = await Promise.all([
           getUserLibrary(),
-          db.mediaItems.where('status').equals('publicado').toArray(),
+          db.mediaItems.toArray(),
           getAllWatchHistory(),
         ]);
         if (!active) return;
-        const published = publishedRaw.filter((item) => !item.archived);
+        const published = publishedRaw.filter(
+          (item) => !item.archived && item.status !== 'offline'
+        );
         setMyListIds(loadedLibrary.myListIds);
         setWatchHistory(history);
         setPublishedDbItems(published);
