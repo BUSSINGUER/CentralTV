@@ -478,7 +478,23 @@ export class BackgroundTaskRunner {
     let updated = await this.runHealthCheck(item, config.probeTimeoutMs, signal);
     let note: string | undefined = updated.lastError;
 
-    // Metadata and trailers are loaded lazily when a user opens the details page.
+    if (signal.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+
+    onStage('tmdb', note);
+    const tmdbRes = await this.runTmdbEnrich(updated, config.tmdbApiKey, signal);
+    updated = tmdbRes.item;
+    if (tmdbRes.note) {
+      note = note ? `${note} | ${tmdbRes.note}` : tmdbRes.note;
+    }
+
+    if (signal.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+
+    onStage('youtube', note);
+    updated = await this.runYoutubeEnrich(updated, config.youtubeApiKey, signal);
 
     return { item: updated, note };
   }
