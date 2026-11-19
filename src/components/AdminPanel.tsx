@@ -58,14 +58,16 @@ import {
   fetchMigrationBackups,
   fetchProcessingTasks,
   pauseProcessingTask,
+  publishApprovedOnServer,
   pullAuthoritativeStateFromServer,
+  resetActiveCatalogOnServer,
   restoreLocalBackupSnapshot,
   resumeProcessingTask,
+  resumeCatalogListUpload,
   rollbackServerMigration,
   runIndexedDbMigrationToServer,
   ServerMigrationBackupItem,
   startProcessingTask,
-  syncCatalogItemsToServer,
   syncWorkPatchToServer,
 } from '../services/persistenceSync';
 import {
@@ -316,6 +318,11 @@ export function AdminPanel({
   const [deletingListId, setDeletingListId] = useState<string | null>(null);
   const [resyncingListId, setResyncingListId] = useState<string | null>(null);
   const [listActionMsg, setListActionMsg] = useState<string | null>(null);
+  const [pendingListProgress, setPendingListProgress] = useState<
+    Record<string, { confirmed: number; total: number }>
+  >({});
+  const pendingListIds = Object.keys(pendingListProgress);
+  const [catalogActionBusy, setCatalogActionBusy] = useState(false);
 
   // EPG state
   const [epgUrlInput, setEpgUrlInput] = useState(settings.epgUrl || '');
@@ -363,16 +370,20 @@ export function AdminPanel({
 
   const refreshItems = useCallback(async () => {
     try {
-      const [all, epg, lists, backups] = await Promise.all([
+      const [all, epg, lists, backups, pendingIds] = await Promise.all([
         db.mediaItems.orderBy('createdAt').reverse().toArray(),
         getAllEpgPrograms(),
         getAllM3uLists(),
         user ? fetchMigrationBackups() : Promise.resolve([]),
+        db.pendingCatalogImports.toArray(),
       ]);
       setItems(all.filter((it) => !it.archived));
       setArchivedCount(all.filter((it) => Boolean(it.archived)).length);
       setEpgCount(epg.length);
       setM3uLists(lists);
+      setPendingListProgress(Object.fromEntries(pendingIds.map((job) => [
+        job.id, { confirmed: job.cursor, total: job.itemIds.length },
+      ])));
       setMigrationBackups(backups);
       onCatalogChanged();
     } catch (err) {
@@ -574,9 +585,12 @@ export function AdminPanel({
 
   // M3U / JSON / Xtream Handlers
   const formatMergeSummary = (result: M3UImportStats) => {
+    if (result.syncError) {
+      return `Arquivo lido, envio incompleto: ${result.syncError} Use “Retomar envio” em Listas.`;
+    }
     const formatLabel =
       result.detectedFormat === 'json' ? 'Catálogo JSON' : 'Lista M3U';
-    return `${formatLabel} importado(a) · Mesclagem inteligente: ${result.newItems} novos títulos na fila, ${result.mergedSources} novas fontes adicionadas a títulos existentes e ${result.ignoredDuplicates} links duplicados ignorados.`;
+    return `${formatLabel} importado(a) · ${result.touchedItemIds?.length || 0} títulos confirmados no servidor. ${result.newItems} novos títulos, ${result.mergedSources} fontes agregadas e ${result.ignoredDuplicates} duplicados ignorados.`;
   };
 
   const handleFileImport = async (file: File, stayOnLists = false) => {
@@ -732,14 +746,20 @@ export function AdminPanel({
     setImportError(null);
     setListActionMsg(null);
     try {
+      if (pendingListIds.includes(list.id)) {
+        const total = await resumeCatalogListUpload(list);
+        await pullAuthoritativeStateFromServer().catch(() => {});
+        await refreshItems();
+        setListActionMsg(`Envio de "${list.name}" concluído. ${total} títulos confirmados pelo servidor.`);
+        return;
+      }
       const result = await resyncM3uList(list, {
         onProgress: (stats) => setImportStats(stats),
       });
       await refreshItems();
-      setListActionMsg(
-        `Lista "${list.name}" re-sincronizada: ${result.newItems} novos títulos, ${result.mergedSources} fontes mescladas e ${result.ignoredDuplicates} duplicados ignorados.`
-      );
+      setListActionMsg(formatMergeSummary(result));
     } catch (err) {
+      await refreshItems();
       setImportError(
         err instanceof Error ? err.message : 'Falha ao re-sincronizar lista.'
       );
@@ -824,38 +844,11 @@ export function AdminPanel({
       // PostgreSQL is authoritative. Starting from it avoids serializing and
       // uploading the entire IndexedDB queue again on every click (45k+ items
       // can otherwise cause a large browser/server memory spike).
-      let res = await startProcessingTask({
+      const res = await startProcessingTask({
         scope: 'all_pending',
-        tmdbApiKey: settings.tmdbApiKey,
-        youtubeApiKey: settings.youtubeApiKey,
         batchSize: settings.batchSize,
         probeTimeoutMs: settings.probeTimeoutMs,
       });
-
-      // Compatibility path for a user whose catalog still exists only in the
-      // old IndexedDB cache. This runs only when the persistent catalog is empty.
-      if (res.empty) {
-        setPipeline((prev) => ({
-          ...prev,
-          lastNote: 'Preparando o acervo local para o primeiro processamento…',
-        }));
-        const pendingItems = items.filter(
-          (i) => (i.status || 'pendente') === 'pendente'
-        );
-        const syncRes = await syncCatalogItemsToServer(pendingItems);
-        if (!syncRes.synced) {
-          throw new Error(
-            syncRes.error || 'Falha ao preparar o acervo local no servidor.'
-          );
-        }
-        res = await startProcessingTask({
-          scope: 'all_pending',
-          tmdbApiKey: settings.tmdbApiKey,
-          youtubeApiKey: settings.youtubeApiKey,
-          batchSize: settings.batchSize,
-          probeTimeoutMs: settings.probeTimeoutMs,
-        });
-      }
 
       if (res.empty || !res.task) {
         setPipeline((prev) => ({
@@ -904,23 +897,10 @@ export function AdminPanel({
     setImportError(null);
     setListActionMsg(null);
     try {
-      const listWorks = items.filter((item) => {
-        const rootHit = (item.sources || []).some((s) => s.listId === list.id);
-        const epHit = (item.episodes || []).some((ep) =>
-          (ep.sources || []).some((s) => s.listId === list.id)
-        );
-        return rootHit || epHit;
-      });
-      if (listWorks.length > 0) {
-        await syncCatalogItemsToServer(listWorks, list, true);
-      }
-
       const res = await startProcessingTask({
         scope: 'list',
         listId: list.id,
         listName: list.name,
-        tmdbApiKey: settings.tmdbApiKey,
-        youtubeApiKey: settings.youtubeApiKey,
         batchSize: settings.batchSize,
         probeTimeoutMs: settings.probeTimeoutMs,
       });
@@ -1013,29 +993,32 @@ export function AdminPanel({
   };
 
   const handlePublishBatch = async () => {
-    const approvedItems = items.filter((i) => i.status === 'aprovado');
-    if (approvedItems.length === 0) return;
-    const now = Date.now();
-    const publishedBatch = approvedItems.map((item) => ({
-      ...item,
-      status: 'publicado' as PublishStatus,
-      updatedAt: now,
-    }));
-    await db.mediaItems.bulkPut(publishedBatch);
-    void syncCatalogItemsToServer(publishedBatch);
-    await refreshItems();
+    setCatalogActionBusy(true);
+    try {
+      const { publishedCount } = await publishApprovedOnServer();
+      setReclassifyMsg(`${publishedCount} títulos publicados no servidor.`);
+      await pullAuthoritativeStateFromServer();
+      await refreshItems();
+    } catch (err) {
+      setReclassifyMsg(err instanceof Error ? err.message : 'Falha ao publicar títulos.');
+    } finally {
+      setCatalogActionBusy(false);
+    }
   };
 
   const handleTogglePublishSingle = async (item: CatalogItem) => {
     const nextStatus: PublishStatus =
       item.status === 'publicado' ? 'aprovado' : 'publicado';
-    await db.mediaItems.put({
-      ...item,
-      status: nextStatus,
-      updatedAt: Date.now(),
-    });
-    void syncWorkPatchToServer(item.id, { status: nextStatus });
-    await refreshItems();
+    setBusyItemId(item.id);
+    try {
+      await syncWorkPatchToServer(item.id, { status: nextStatus });
+      await db.mediaItems.update(item.id, { status: nextStatus, updatedAt: Date.now() });
+      await refreshItems();
+    } catch (err) {
+      setReclassifyMsg(err instanceof Error ? err.message : 'Falha ao alterar a publicação.');
+    } finally {
+      setBusyItemId(null);
+    }
   };
 
   const handleChangePlatform = async (
@@ -1047,7 +1030,7 @@ export function AdminPanel({
       platform,
       updatedAt: Date.now(),
     });
-    void syncWorkPatchToServer(item.id, { platform });
+    void syncWorkPatchToServer(item.id, { platform }).catch((err: Error) => setReclassifyMsg(err.message));
     await refreshItems();
   };
 
@@ -1070,10 +1053,22 @@ export function AdminPanel({
   };
 
   const handleClearAllDb = async () => {
-    await Promise.all([db.mediaItems.clear(), db.m3u_lists.clear()]);
-    setReclassifyMsg('Cache local e listas limpos no dispositivo.');
-    setImportResultMsg(null);
-    await refreshItems();
+    const confirmation = window.prompt(
+      'Todas as listas serão removidas do servidor e os títulos serão arquivados. Fichas, favoritos e histórico serão preservados. Digite ZERAR CATÁLOGO para confirmar.'
+    );
+    if (confirmation !== 'ZERAR CATÁLOGO') return;
+    setCatalogActionBusy(true);
+    try {
+      const result = await resetActiveCatalogOnServer(confirmation);
+      setImportStats(null);
+      setImportResultMsg(null);
+      setReclassifyMsg(`Catálogo zerado no servidor. ${result.removedLists} listas removidas, ${result.archivedWorks} fichas arquivadas.`);
+      await refreshItems();
+    } catch (err) {
+      setReclassifyMsg(err instanceof Error ? err.message : 'Falha ao zerar o catálogo.');
+    } finally {
+      setCatalogActionBusy(false);
+    }
   };
 
   const handleDeleteM3uList = async (list: M3uListRecord) => {
@@ -1086,6 +1081,8 @@ export function AdminPanel({
       setListActionMsg(
         `Lista "${list.name}" excluída: ${res.removedSources} fontes removidas, ${res.updatedItems} títulos mantidos com outras listas e ${res.archivedItems} fichas arquivadas (metadados, favoritos e histórico preservados até reimportação).`
       );
+    } catch (err) {
+      setListActionMsg(err instanceof Error ? err.message : 'Falha ao excluir lista.');
     } finally {
       setDeletingListId(null);
     }
@@ -1713,11 +1710,10 @@ export function AdminPanel({
             <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
               <div>
                 <h2 className="font-display text-lg font-bold text-white">
-                  Pipeline de Pré-Publicação (Etapas A · B · C)
+                  Pipeline de Pré-Publicação
                 </h2>
                 <p className="text-xs text-white/60">
-                  A: Teste de Stream · B: TMDB pt-BR + Plataforma · C: Trailer
-                  Dublado YouTube
+                  Verifica as fontes. Ficha e trailer são buscados ao abrir o título.
                 </p>
               </div>
 
@@ -1725,7 +1721,7 @@ export function AdminPanel({
                 {!pipeline.running ? (
                   <button
                     type="button"
-                    disabled={counts.pendente === 0}
+                    disabled={counts.pendente === 0 || importing || Boolean(resyncingListId) || pendingListIds.length > 0 || catalogActionBusy}
                     onClick={handleRunBatchPipeline}
                     className="inline-flex h-10 items-center gap-2 rounded-lg bg-[#E50914] px-4 text-xs font-bold text-white transition-colors hover:bg-[#c80812] disabled:cursor-not-allowed disabled:opacity-40"
                   >
@@ -1763,7 +1759,7 @@ export function AdminPanel({
 
                 <button
                   type="button"
-                  disabled={counts.aprovado === 0}
+                  disabled={counts.aprovado === 0 || importing || Boolean(resyncingListId) || pendingListIds.length > 0 || catalogActionBusy}
                   onClick={handlePublishBatch}
                   className="inline-flex h-10 items-center gap-2 rounded-lg bg-white px-4 text-xs font-bold text-[#0B0C0E] transition-colors hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-40"
                 >
@@ -1792,10 +1788,11 @@ export function AdminPanel({
                   </button>
                 )}
 
-                {counts.total > 0 && (
+                {(counts.total > 0 || m3uLists.length > 0) && (
                   <button
                     type="button"
                     onClick={handleClearAllDb}
+                    disabled={catalogActionBusy || pipeline.running || importing || Boolean(resyncingListId) || Boolean(deletingListId)}
                     className="inline-flex h-10 items-center gap-1.5 rounded-lg border border-white/10 px-3 text-xs font-medium text-white/55 hover:border-rose-500/40 hover:text-rose-300"
                   >
                     Zerar Banco
@@ -2142,7 +2139,7 @@ export function AdminPanel({
                                 type="button"
                                 disabled={busyItemId === item.id}
                                 onClick={() => handleProcessSingle(item)}
-                                title="Testar link + TMDB + YouTube"
+                                title="Testar disponibilidade da fonte"
                                 className="rounded border border-white/15 bg-[#181B20] px-2.5 py-1 text-xs font-medium text-white/85 hover:bg-white/10 disabled:opacity-40"
                               >
                                 <RefreshCw
@@ -2394,7 +2391,9 @@ export function AdminPanel({
                 const isConfirming = confirmDeleteListId === list.id;
                 const isDeleting = deletingListId === list.id;
                 const isResyncing = resyncingListId === list.id;
-                const canResync =
+                const uploadPending = pendingListIds.includes(list.id);
+                const uploadProgress = pendingListProgress[list.id];
+                const canResync = uploadPending ||
                   (list.sourceType === 'xtream' &&
                     Boolean(list.xtreamCredentials)) ||
                   ((list.sourceType === 'url' || list.sourceType === 'json') &&
@@ -2480,6 +2479,11 @@ export function AdminPanel({
                               {live.titleCount}
                             </strong>
                           </span>
+                          {uploadProgress && (
+                            <span className="text-amber-300">
+                              Envio pendente · {uploadProgress.confirmed}/{uploadProgress.total} títulos confirmados
+                            </span>
+                          )}
                           <span>
                             Fontes vinculadas:{' '}
                             <strong className="text-sky-300">
@@ -2506,7 +2510,7 @@ export function AdminPanel({
                             disabled={
                               verifyingListId === list.id ||
                               live.titleCount === 0 ||
-                              importing
+                              importing || uploadPending || catalogActionBusy
                             }
                             onClick={() => void handleVerifyListInBackground(list)}
                             className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-white/15 bg-[#181B20] px-3.5 text-xs font-semibold text-white hover:bg-white/10 disabled:opacity-45"
@@ -2521,7 +2525,7 @@ export function AdminPanel({
                         {canResync && !isConfirming && (
                           <button
                             type="button"
-                            disabled={isResyncing || importing}
+                            disabled={Boolean(resyncingListId) || importing || catalogActionBusy || Boolean(deletingListId)}
                             onClick={() => void handleResyncM3uList(list)}
                             className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-white/15 bg-[#181B20] px-3.5 text-xs font-semibold text-white hover:bg-white/10 disabled:opacity-45"
                           >
@@ -2532,7 +2536,7 @@ export function AdminPanel({
                             />
                             {isResyncing
                               ? 'Sincronizando...'
-                              : 'Re-sincronizar'}
+                              : uploadPending ? 'Retomar envio' : 'Re-sincronizar'}
                           </button>
                         )}
 
@@ -2544,7 +2548,7 @@ export function AdminPanel({
                             </span>
                             <button
                               type="button"
-                              disabled={isDeleting}
+                              disabled={isDeleting || importing || Boolean(resyncingListId) || catalogActionBusy}
                               onClick={() => void handleDeleteM3uList(list)}
                               className="inline-flex h-8 items-center gap-1.5 rounded-md bg-rose-600 px-3 text-xs font-bold text-white hover:bg-rose-500 disabled:opacity-50"
                             >

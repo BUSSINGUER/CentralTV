@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { and, desc, eq, inArray } from 'drizzle-orm';
+import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import type {
   CatalogItem,
   MediaFormatBadge,
@@ -19,11 +19,12 @@ import {
   getCandidateProvisionalKeys,
   sortAndRelabelSourcesList,
 } from '../utils/identity.ts';
-import { pgDb, executeWithDbRetry } from './index.ts';
+import { pgDb, lockCatalogWrites, withCatalogWrite } from './index.ts';
 import {
   episodes,
   lists,
   migrationBackups,
+  processingTasks,
   seasons,
   servers,
   sourceAvailability,
@@ -598,12 +599,12 @@ async function upsertSourceRow(
   if (!sourceId) {
     if (src.id) {
       const idTaken = await tx
-        .select({ id: sources.id, workId: sources.workId })
+        .select({ id: sources.id })
         .from(sources)
         .where(eq(sources.id, src.id))
         .limit(1);
       sourceId =
-        idTaken.length === 0 || idTaken[0].workId === workId
+        idTaken.length === 0
           ? src.id
           : `src-${crypto.randomUUID().slice(0, 12)}`;
     } else {
@@ -1073,6 +1074,7 @@ export async function upsertWorkInsideTx(
 export async function syncCatalogBatchToPostgres(params: {
   items: CatalogItem[];
   list?: M3uListRecord;
+  importListId?: string;
   mergeWithoutOverwrite?: boolean;
 }): Promise<{
   idMap: Record<string, string>;
@@ -1081,36 +1083,37 @@ export async function syncCatalogBatchToPostgres(params: {
   reactivatedCount: number;
 }> {
   const now = Date.now();
-  const idMap: Record<string, string> = {};
-  let createdCount = 0;
-  let mergedCount = 0;
-  let reactivatedCount = 0;
-
   try {
-    await executeWithDbRetry(() =>
-      pgDb.transaction(async (tx) => {
-        if (params.list) {
-          await upsertListRecordToPostgres(tx, params.list, now);
-        }
+    return await withCatalogWrite(async (tx) => {
+      const idMap: Record<string, string> = {};
+      let createdCount = 0;
+      let mergedCount = 0;
+      let reactivatedCount = 0;
+      if (params.list) {
+        await upsertListRecordToPostgres(tx, params.list, now);
+      }
 
-        for (const item of params.items) {
-          const res = await upsertWorkInsideTx(tx, item, {
-            mergeWithoutOverwrite: Boolean(params.mergeWithoutOverwrite),
-            preserveAvailability: Boolean(params.mergeWithoutOverwrite),
-            now,
-          });
-          if (item.id) {
-            idMap[item.id] = res.workId;
-          }
-          if (res.created) createdCount += 1;
-          else mergedCount += 1;
-          if (res.reactivated) reactivatedCount += 1;
-        }
-      })
-    );
+      if (params.importListId) {
+        const [list] = await tx.select({ id: lists.id }).from(lists)
+          .where(eq(lists.id, params.importListId)).limit(1);
+        if (!list) throw new CatalogConflictError('A lista foi removida. Inicie uma nova importação com o arquivo original.');
+      }
 
-    return { idMap, createdCount, mergedCount, reactivatedCount };
+      for (const item of params.items) {
+        const res = await upsertWorkInsideTx(tx, item, {
+          mergeWithoutOverwrite: Boolean(params.mergeWithoutOverwrite),
+          preserveAvailability: Boolean(params.mergeWithoutOverwrite),
+          now,
+        });
+        if (item.id) idMap[item.id] = res.workId;
+        if (res.created) createdCount += 1;
+        else mergedCount += 1;
+        if (res.reactivated) reactivatedCount += 1;
+      }
+      return { idMap, createdCount, mergedCount, reactivatedCount };
+    });
   } catch (error) {
+    if (error instanceof CatalogConflictError) throw error;
     console.error('Failed to sync catalog batch to PostgreSQL:', error);
     throw new Error('Falha ao persistir alterações do catálogo.', {
       cause: error,
@@ -1118,6 +1121,32 @@ export async function syncCatalogBatchToPostgres(params: {
   }
 }
 
+export class CatalogConflictError extends Error {}
+
+export async function publishApprovedWorksInPostgres(): Promise<number> {
+  return withCatalogWrite(async (tx) => {
+    const published = await tx.update(works)
+      .set({ status: 'publicado', updatedAt: Date.now() })
+      .where(and(eq(works.archived, false), eq(works.status, 'aprovado')))
+      .returning({ id: works.id });
+    return published.length;
+  });
+}
+
+export async function resetActiveCatalogInPostgres() {
+  return withCatalogWrite(async (tx) => {
+    const [activeTask] = await tx.select({ id: processingTasks.id }).from(processingTasks)
+      .where(inArray(processingTasks.status, ['queued', 'running', 'paused'])).limit(1);
+    if (activeTask) {
+      throw new CatalogConflictError('Encerre ou cancele as verificações em andamento antes de zerar o catálogo.');
+    }
+    const archived = await tx.update(works).set({ archived: true, updatedAt: Date.now() })
+      .where(eq(works.archived, false)).returning({ id: works.id });
+    // The existing FK removes only the sources linked to these lists.
+    const removed = await tx.delete(lists).returning({ id: lists.id });
+    return { archivedWorks: archived.length, removedLists: removed.length };
+  });
+}
 /**
  * Decoupled list deletion:
  * - Removes ONLY sources linked to `listId` and the `lists` row itself.
@@ -1133,78 +1162,50 @@ export async function deleteListDecoupledFromPostgres(listId: string): Promise<{
   const now = Date.now();
 
   try {
-    return await executeWithDbRetry(() =>
-      pgDb.transaction(async (tx) => {
-      const listSources = await tx
-        .select({
-          id: sources.id,
-          workId: sources.workId,
-        })
-        .from(sources)
-        .where(eq(sources.listId, listId));
-
-      const affectedWorkIds = Array.from(
-        new Set(listSources.map((s) => s.workId))
-      );
-
-      if (listSources.length > 0) {
-        await tx.delete(sources).where(eq(sources.listId, listId));
-      }
+    return await withCatalogWrite(async (tx) => {
+      const removedSources = await tx.delete(sources).where(eq(sources.listId, listId))
+        .returning({ workId: sources.workId });
       await tx.delete(lists).where(eq(lists.id, listId));
 
-      let updatedWorks = 0;
-      let archivedWorks = 0;
+      const affectedWorkIds = Array.from(new Set(removedSources.map((source) => source.workId)));
       const archivedWorkIds: string[] = [];
+      let updatedWorks = 0;
+      for (let offset = 0; offset < affectedWorkIds.length; offset += 2000) {
+        const workIds = affectedWorkIds.slice(offset, offset + 2000);
+        const updated = await tx.update(works)
+          .set({
+            archived: sql`not exists (select 1 from ${sources} where ${sources.workId} = ${works.id})`,
+            updatedAt: now,
+          })
+          .where(inArray(works.id, workIds))
+          .returning({ id: works.id, archived: works.archived });
 
-      for (const workId of affectedWorkIds) {
-        const remaining = await tx
-          .select()
-          .from(sources)
-          .where(eq(sources.workId, workId));
-
-        if (remaining.length === 0) {
-          await tx
-            .update(works)
-            .set({ archived: true, updatedAt: now })
-            .where(eq(works.id, workId));
-          archivedWorks += 1;
-          archivedWorkIds.push(workId);
-        } else {
-          const has4k = remaining.some(
-            (s) =>
-              s.resolutionTag === '4K' ||
-              (s.qualityTag || '').toUpperCase().includes('4K')
-          );
-          await tx
-            .update(works)
-            .set({ archived: false, updatedAt: now })
-            .where(eq(works.id, workId));
-
-          if (!has4k) {
-            const meta = await tx
-              .select({ qualityBadge: workMetadata.qualityBadge })
-              .from(workMetadata)
-              .where(eq(workMetadata.workId, workId))
-              .limit(1);
-            if (meta[0]?.qualityBadge === '4K') {
-              await tx
-                .update(workMetadata)
-                .set({ qualityBadge: null, updatedAt: now })
-                .where(eq(workMetadata.workId, workId));
-            }
-          }
-          updatedWorks += 1;
+        const activeIds: string[] = [];
+        for (const work of updated) {
+          if (work.archived) archivedWorkIds.push(work.id);
+          else activeIds.push(work.id);
         }
+        updatedWorks += activeIds.length;
+        if (activeIds.length === 0) continue;
+
+        await tx.update(workMetadata).set({ qualityBadge: null, updatedAt: now }).where(and(
+          inArray(workMetadata.workId, activeIds),
+          eq(workMetadata.qualityBadge, '4K'),
+          sql`not exists (
+            select 1 from ${sources}
+            where ${sources.workId} = ${workMetadata.workId}
+              and (${sources.resolutionTag} = '4K' or upper(${sources.qualityTag}) like '%4K%')
+          )`
+        ));
       }
 
       return {
-        removedSources: listSources.length,
+        removedSources: removedSources.length,
         updatedWorks,
-        archivedWorks,
+        archivedWorks: archivedWorkIds.length,
         archivedWorkIds,
       };
-    })
-  );
+    });
   } catch (error) {
     console.error('Failed to delete list in decoupled mode:', error);
     throw new Error('Falha ao excluir lista sem perder fichas do acervo.', {
@@ -1466,6 +1467,7 @@ export async function migrateIndexedDbWithBackup(
 
   try {
     await pgDb.transaction(async (tx) => {
+      await lockCatalogWrites(tx);
       const existingWorks = await tx
         .select({ id: works.id })
         .from(works);
@@ -1702,6 +1704,7 @@ export async function rollbackMigrationBackup(
   const now = Date.now();
   try {
     return await pgDb.transaction(async (tx) => {
+      await lockCatalogWrites(tx);
       const found = await tx
         .select()
         .from(migrationBackups)
@@ -1796,66 +1799,73 @@ export async function updateWorkStatusOrDeleteInPostgres(params: {
 }): Promise<void> {
   const now = Date.now();
   try {
-    if (params.action === 'delete') {
-      await pgDb.delete(works).where(eq(works.id, params.workId));
-      return;
-    }
-
-    if (params.patch) {
-      const wPatch: Partial<typeof works.$inferInsert> = { updatedAt: now };
-      if (params.patch.status) wPatch.status = params.patch.status;
-      if (typeof params.patch.tmdbId === 'number')
-        wPatch.tmdbId = params.patch.tmdbId;
-      if (params.patch.title) wPatch.title = params.patch.title;
-      if (typeof params.patch.year === 'number') wPatch.year = params.patch.year;
-      if (typeof params.patch.healthChecked === 'boolean')
-        wPatch.healthChecked = params.patch.healthChecked;
-      if (typeof params.patch.archived === 'boolean')
-        wPatch.archived = params.patch.archived;
-      if (params.patch.lastError !== undefined)
-        wPatch.lastError = params.patch.lastError;
-
-      await pgDb.update(works).set(wPatch).where(eq(works.id, params.workId));
-
-      const mPatch: Partial<typeof workMetadata.$inferInsert> = {
-        updatedAt: now,
-      };
-      if (params.patch.platform) mPatch.platform = params.patch.platform;
-      if (params.patch.synopsis !== undefined)
-        mPatch.synopsis = params.patch.synopsis;
-      if (Array.isArray(params.patch.genres))
-        mPatch.genresJson = JSON.stringify(params.patch.genres);
-      if (Array.isArray(params.patch.cast))
-        mPatch.castJson = JSON.stringify(params.patch.cast);
-      if (params.patch.director !== undefined)
-        mPatch.director = params.patch.director;
-      if (params.patch.duration !== undefined)
-        mPatch.duration = params.patch.duration;
-      if (typeof params.patch.durationSeconds === 'number')
-        mPatch.durationSeconds = params.patch.durationSeconds;
-      if (params.patch.qualityBadge !== undefined)
-        mPatch.qualityBadge = params.patch.qualityBadge;
-      if (typeof params.patch.voteAverage === 'number')
-        mPatch.voteAverage = params.patch.voteAverage;
-      if (params.patch.posterImage !== undefined)
-        mPatch.posterImage = params.patch.posterImage;
-      if (params.patch.backdropImage !== undefined)
-        mPatch.backdropImage = params.patch.backdropImage;
-      if (params.patch.youtubeTrailerId !== undefined)
-        mPatch.youtubeTrailerId = params.patch.youtubeTrailerId;
-      if (typeof params.patch.tmdbEnriched === 'boolean') {
-        mPatch.tmdbEnriched = params.patch.tmdbEnriched;
-        if (params.patch.tmdbEnriched) mPatch.enrichedAt = now;
+    await withCatalogWrite(async (tx) => {
+      if (params.action === 'delete') {
+        await tx.delete(works).where(eq(works.id, params.workId));
+        return;
       }
-      if (typeof params.patch.youtubeEnriched === 'boolean')
-        mPatch.youtubeEnriched = params.patch.youtubeEnriched;
 
-      await pgDb
-        .update(workMetadata)
-        .set(mPatch)
-        .where(eq(workMetadata.workId, params.workId));
-    }
+      if (params.patch) {
+        const wPatch: Partial<typeof works.$inferInsert> = { updatedAt: now };
+        if (params.patch.status) wPatch.status = params.patch.status;
+        if (typeof params.patch.tmdbId === 'number')
+          wPatch.tmdbId = params.patch.tmdbId;
+        if (params.patch.title) wPatch.title = params.patch.title;
+        if (typeof params.patch.year === 'number') wPatch.year = params.patch.year;
+        if (typeof params.patch.healthChecked === 'boolean')
+          wPatch.healthChecked = params.patch.healthChecked;
+        if (typeof params.patch.archived === 'boolean')
+          wPatch.archived = params.patch.archived;
+        if (params.patch.lastError !== undefined)
+          wPatch.lastError = params.patch.lastError;
+
+        const [updated] = await tx.update(works).set(wPatch)
+          .where(and(eq(works.id, params.workId), eq(works.archived, false)))
+          .returning({ id: works.id });
+        if (!updated) throw new CatalogConflictError('Este título não está ativo no catálogo do servidor.');
+
+        const mPatch: Partial<typeof workMetadata.$inferInsert> = {
+          updatedAt: now,
+        };
+        if (params.patch.platform) mPatch.platform = params.patch.platform;
+        if (params.patch.synopsis !== undefined)
+          mPatch.synopsis = params.patch.synopsis;
+        if (Array.isArray(params.patch.genres))
+          mPatch.genresJson = JSON.stringify(params.patch.genres);
+        if (Array.isArray(params.patch.cast))
+          mPatch.castJson = JSON.stringify(params.patch.cast);
+        if (params.patch.director !== undefined)
+          mPatch.director = params.patch.director;
+        if (params.patch.duration !== undefined)
+          mPatch.duration = params.patch.duration;
+        if (typeof params.patch.durationSeconds === 'number')
+          mPatch.durationSeconds = params.patch.durationSeconds;
+        if (params.patch.qualityBadge !== undefined)
+          mPatch.qualityBadge = params.patch.qualityBadge;
+        if (typeof params.patch.voteAverage === 'number')
+          mPatch.voteAverage = params.patch.voteAverage;
+        if (params.patch.posterImage !== undefined)
+          mPatch.posterImage = params.patch.posterImage;
+        if (params.patch.backdropImage !== undefined)
+          mPatch.backdropImage = params.patch.backdropImage;
+        if (params.patch.youtubeTrailerId !== undefined)
+          mPatch.youtubeTrailerId = params.patch.youtubeTrailerId;
+        if (typeof params.patch.tmdbEnriched === 'boolean') {
+          mPatch.tmdbEnriched = params.patch.tmdbEnriched;
+          if (params.patch.tmdbEnriched) mPatch.enrichedAt = now;
+        }
+        if (typeof params.patch.youtubeEnriched === 'boolean')
+          mPatch.youtubeEnriched = params.patch.youtubeEnriched;
+
+        if (Object.keys(mPatch).length === 1) return;
+        await tx
+          .update(workMetadata)
+          .set(mPatch)
+          .where(eq(workMetadata.workId, params.workId));
+      }
+    });
   } catch (error) {
+    if (error instanceof CatalogConflictError) throw error;
     console.error('Failed to update/delete work in PostgreSQL:', error);
     throw new Error('Falha ao atualizar obra no banco.', { cause: error });
   }

@@ -9,6 +9,12 @@ import {
   WatchHistoryRecord,
 } from '../types/streaming';
 
+export interface PendingCatalogImport {
+  id: string;
+  itemIds: string[];
+  cursor: number;
+}
+
 class AuraStreamDatabase extends Dexie {
   mediaItems!: EntityTable<CatalogItem, 'id'>;
   appSettings!: EntityTable<AppSettings, 'key'>;
@@ -16,6 +22,7 @@ class AuraStreamDatabase extends Dexie {
   epgPrograms!: EntityTable<EpgProgram, 'id'>;
   m3u_lists!: EntityTable<M3uListRecord, 'id'>;
   watchHistory!: EntityTable<WatchHistoryRecord, 'id'>;
+  pendingCatalogImports!: EntityTable<PendingCatalogImport, 'id'>;
 
   constructor() {
     super('AuraStreamDB');
@@ -49,6 +56,7 @@ class AuraStreamDatabase extends Dexie {
       m3u_lists: 'id, name, sourceType, importedAt',
       watchHistory: 'id, itemId, updatedAt',
     });
+    this.version(5).stores({ pendingCatalogImports: 'id' });
   }
 }
 

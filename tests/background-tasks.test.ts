@@ -143,7 +143,7 @@ test('Background task HTTP endpoints require Firebase authentication (fail-close
   }
 });
 
-test('Background runner completes list verification independent of UI, skips episode probing on series, and persists TMDB/YouTube', async () => {
+test('Background runner verifies sources independently of UI and leaves enrichment for details', async () => {
   const listId = `${TEST_RUN_TAG}-list-1`;
   createdListIds.add(listId);
 
@@ -241,17 +241,6 @@ test('Background runner completes list verification independent of UI, skips epi
         reason: 'Stream ativo',
       };
     },
-    enrichTmdb: async ({ title }) => ({
-      found: true,
-      tmdbId: title.includes('Matrix') ? 603 : title.includes('Cors') ? 604 : 605,
-      title,
-      synopsis: `Sinopse TMDB para ${title}`,
-      posterImage: 'https://image.tmdb.org/t/p/w780/mock.jpg',
-    }),
-    searchYoutube: async () => ({
-      videoId: 'dQw4w9WgXcQ',
-      source: 'youtube-api',
-    }),
   });
 
   const created = await createOrEnqueueProcessingTask({
@@ -292,22 +281,22 @@ test('Background runner completes list verification independent of UI, skips epi
     false
   );
 
-  // Verify persisted Postgres work states & enrichment
+  // Verify persisted statuses without eager metadata.
   const hydratedOk = await getHydratedWorkByIdFromPostgres(wOnline);
   const hydratedCors = await getHydratedWorkByIdFromPostgres(wCors);
   const hydratedSeries = await getHydratedWorkByIdFromPostgres(wSeries);
 
   assert.equal(hydratedOk?.status, 'aprovado');
-  assert.equal(hydratedOk?.tmdbEnriched, true);
-  assert.equal(hydratedOk?.youtubeTrailerId, 'dQw4w9WgXcQ');
+  assert.equal(hydratedOk?.tmdbEnriched, false);
+  assert.equal(hydratedOk?.youtubeTrailerId, '');
 
   assert.equal(hydratedCors?.status, 'pendente');
-  assert.equal(hydratedCors?.tmdbEnriched, true);
-  assert.equal(hydratedCors?.youtubeTrailerId, 'dQw4w9WgXcQ');
+  assert.equal(hydratedCors?.tmdbEnriched, false);
+  assert.equal(hydratedCors?.youtubeTrailerId, '');
 
   assert.equal(hydratedSeries?.status, 'aprovado');
-  assert.equal(hydratedSeries?.tmdbEnriched, true);
-  assert.equal(hydratedSeries?.youtubeTrailerId, 'dQw4w9WgXcQ');
+  assert.equal(hydratedSeries?.tmdbEnriched, false);
+  assert.equal(hydratedSeries?.youtubeTrailerId, '');
 
   await runner.shutdown();
 });
@@ -395,8 +384,6 @@ test('Prevents duplicate open tasks and automatically queues a second distinct t
         status: 200,
       };
     },
-    enrichTmdb: async ({ title }) => ({ found: true, tmdbId: 700, title }),
-    searchYoutube: async () => ({ videoId: 'abc123def45' }),
   });
 
   const first = await createOrEnqueueProcessingTask({
@@ -535,8 +522,6 @@ test('Pause, resume, cancel, and simulated server restart resume from saved curs
       }
       return { ok: true, validationState: 'media_available', status: 200 };
     },
-    enrichTmdb: async ({ title }) => ({ found: true, tmdbId: 800, title }),
-    searchYoutube: async () => ({ videoId: 'xyz987uvw12' }),
   });
 
   const taskCreated = await createOrEnqueueProcessingTask({
@@ -577,8 +562,6 @@ test('Pause, resume, cancel, and simulated server restart resume from saved curs
       probeCallsByInstance.r2.push(url);
       return { ok: true, validationState: 'media_available', status: 200 };
     },
-    enrichTmdb: async ({ title }) => ({ found: true, tmdbId: 801, title }),
-    searchYoutube: async () => ({ videoId: 'rst123abc45' }),
   });
 
   const recoveredCount = await runner2.recoverInterruptedTasks();
@@ -646,8 +629,6 @@ test('Pause, resume, cancel, and simulated server restart resume from saved curs
         );
       });
     },
-    enrichTmdb: async ({ title }) => ({ found: true, tmdbId: 900, title }),
-    searchYoutube: async () => ({ videoId: null }),
   });
 
   const cancelTaskRes = await createOrEnqueueProcessingTask({

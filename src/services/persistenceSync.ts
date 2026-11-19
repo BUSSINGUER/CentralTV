@@ -13,6 +13,28 @@ import {
 } from '../types/streaming';
 
 const LOCAL_BACKUP_STORAGE_KEY = 'aura_idb_backup_snapshot_v1';
+let catalogCacheEpoch = 0;
+let localImportsInProgress = 0;
+const activeListUploads = new Set<string>();
+const CATALOG_BATCH_SIZE = 250;
+
+export async function withLocalCatalogImport<T>(operation: () => Promise<T>): Promise<T> {
+  localImportsInProgress++;
+  catalogCacheEpoch++;
+  try {
+    return await operation();
+  } finally {
+    localImportsInProgress--;
+  }
+}
+
+async function readCatalogResponse<T>(response: Response): Promise<T> {
+  const data = await response.json().catch(() => null);
+  if (!response.ok || !data) {
+    throw new Error(data?.error || `Falha na operação do catálogo (HTTP ${response.status}).`);
+  }
+  return data as T;
+}
 
 export interface LocalBackupSnapshot {
   createdAt: number;
@@ -209,6 +231,7 @@ export async function pullAuthoritativeStateFromServer(options?: {
   myListIds: string[];
   watchHistory: WatchHistoryRecord[];
 }> {
+  const cacheEpoch = catalogCacheEpoch;
   const headers = await getBearerHeaders();
   if (!headers) {
     return {
@@ -255,17 +278,18 @@ export async function pullAuthoritativeStateFromServer(options?: {
     db.m3u_lists,
     db.userLibrary,
     db.watchHistory,
+    db.pendingCatalogImports,
     async () => {
-      if (serverWorks.length > 0 || replaceEmpty) {
-        await db.mediaItems.clear();
-        if (serverWorks.length > 0) {
-          await db.mediaItems.bulkPut(serverWorks);
+      if (cacheEpoch !== catalogCacheEpoch) return;
+      // A partial server snapshot cannot replace data needed for a pending upload.
+      if (localImportsInProgress === 0 && (await db.pendingCatalogImports.count()) === 0) {
+        if (serverWorks.length > 0 || replaceEmpty) {
+          await db.mediaItems.clear();
+          if (serverWorks.length > 0) await db.mediaItems.bulkPut(serverWorks);
         }
-      }
-      if (serverLists.length > 0 || serverWorks.length > 0 || replaceEmpty) {
-        await db.m3u_lists.clear();
-        if (serverLists.length > 0) {
-          await db.m3u_lists.bulkPut(serverLists);
+        if (serverLists.length > 0 || serverWorks.length > 0 || replaceEmpty) {
+          await db.m3u_lists.clear();
+          if (serverLists.length > 0) await db.m3u_lists.bulkPut(serverLists);
         }
       }
 
@@ -296,6 +320,11 @@ export async function runIndexedDbMigrationToServer(
   const headers = await getBearerHeaders();
   if (!headers) return null;
 
+  if (source === 'indexeddb_auto') {
+    if (localImportsInProgress || await db.pendingCatalogImports.count()) return null;
+    const server = await pullAuthoritativeStateFromServer();
+    if (!server.synced || server.works.length > 0 || server.lists.length > 0) return null;
+  }
   const snapshot = await createLocalBackupSnapshot();
 
   const hasLocalPayload =
@@ -305,7 +334,6 @@ export async function runIndexedDbMigrationToServer(
     snapshot.myListIds.length > 0;
 
   if (!hasLocalPayload && source === 'indexeddb_auto') {
-    await pullAuthoritativeStateFromServer();
     return null;
   }
 
@@ -340,6 +368,54 @@ export async function runIndexedDbMigrationToServer(
   return summary;
 }
 
+export async function resumeCatalogListUpload(list: M3uListRecord, signal?: AbortSignal) {
+  if (activeListUploads.has(list.id)) throw new Error('Esta lista já está sincronizando.');
+  activeListUploads.add(list.id);
+  try {
+    let pending = await db.pendingCatalogImports.get(list.id);
+    if (!pending) return 0;
+    const total = pending.itemIds.length;
+    do {
+      signal?.throwIfAborted();
+      const end = Math.min(pending.cursor + CATALOG_BATCH_SIZE, total);
+      const rows = await db.mediaItems.bulkGet(pending.itemIds.slice(pending.cursor, end));
+      const items = rows.map((item) => {
+        if (!item) {
+          throw new Error('Há títulos ausentes na cópia local. Preserve o arquivo M3U para recuperar esta lista.');
+        }
+        return {
+          ...item,
+          sources: item.sources?.filter((source) => source.listId === list.id),
+          episodes: item.episodes?.flatMap((episode) => {
+            const sources = episode.sources.filter((source) => source.listId === list.id);
+            return sources.length ? [{ ...episode, sources }] : [];
+          }),
+        };
+      });
+      const response = await fetchWithAuthRetry('/api/catalog/sync', {
+        method: 'POST',
+        signal,
+        body: JSON.stringify({
+          items,
+          list: pending.cursor === 0 ? list : undefined,
+          importListId: list.id,
+          mergeWithoutOverwrite: true,
+        }),
+      });
+      const data = await readCatalogResponse<{ idMap?: Record<string, string> }>(response);
+      if (data.idMap) await remapLocalIdsIfNeeded(data.idMap);
+      await db.pendingCatalogImports.where('id').equals(list.id).modify((record) => {
+        record.cursor = Math.max(record.cursor, end);
+      });
+      pending = await db.pendingCatalogImports.get(list.id);
+    } while (pending && pending.cursor < total);
+    await db.pendingCatalogImports.delete(list.id);
+    return total;
+  } finally {
+    activeListUploads.delete(list.id);
+  }
+}
+
 export async function syncCatalogItemsToServer(
   items: CatalogItem[],
   list?: M3uListRecord,
@@ -350,7 +426,7 @@ export async function syncCatalogItemsToServer(
   if (!headers) return { synced: false };
 
   try {
-    const chunkSize = 250;
+    const chunkSize = CATALOG_BATCH_SIZE;
     for (let i = 0; i < Math.max(1, items.length); i += chunkSize) {
       const slice = items.slice(i, i + chunkSize);
       const resp = await fetch('/api/catalog/sync', {
@@ -388,17 +464,38 @@ export async function syncWorkPatchToServer(
   workId: string,
   patch: Partial<CatalogItem>
 ): Promise<void> {
-  const headers = await getBearerHeaders();
-  if (!headers) return;
-  try {
-    await fetch(`/api/catalog/works/${encodeURIComponent(workId)}`, {
-      method: 'PATCH',
-      headers,
-      body: JSON.stringify(patch),
-    });
-  } catch {
-    // Keep IndexedDB operational
+  await readCatalogResponse(await fetchWithAuthRetry(`/api/catalog/works/${encodeURIComponent(workId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  }));
+  if (patch.status) catalogCacheEpoch++;
+}
+
+export async function publishApprovedOnServer() {
+  const result = await readCatalogResponse<{ publishedCount: number }>(
+    await fetchWithAuthRetry('/api/catalog/publish-approved', { method: 'POST' })
+  );
+  catalogCacheEpoch++;
+  return result;
+}
+
+export async function resetActiveCatalogOnServer(confirmation: string) {
+  if (localImportsInProgress || activeListUploads.size) {
+    throw new Error('Aguarde o envio das listas antes de zerar o catálogo.');
   }
+  const result = await readCatalogResponse<{ removedLists: number; archivedWorks: number }>(
+    await fetchWithAuthRetry('/api/catalog/reset', {
+      method: 'POST',
+      body: JSON.stringify({ confirmation }),
+    })
+  );
+  catalogCacheEpoch++;
+  await db.transaction('rw', db.mediaItems, db.m3u_lists, db.pendingCatalogImports, async () => {
+    await db.mediaItems.clear();
+    await db.m3u_lists.clear();
+    await db.pendingCatalogImports.clear();
+  });
+  return result;
 }
 
 export async function deleteWorkOnServer(workId: string): Promise<void> {
@@ -418,23 +515,14 @@ export async function deleteListOnServer(listId: string): Promise<{
   removedSources: number;
   updatedWorks: number;
   archivedWorks: number;
-} | null> {
-  const headers = await getBearerHeaders();
-  if (!headers) return null;
-  try {
-    const resp = await fetch(`/api/lists/${encodeURIComponent(listId)}`, {
-      method: 'DELETE',
-      headers,
-    });
-    if (!resp.ok) return null;
-    return (await resp.json()) as {
-      removedSources: number;
-      updatedWorks: number;
-      archivedWorks: number;
-    };
-  } catch {
-    return null;
-  }
+}> {
+  if (activeListUploads.has(listId)) throw new Error('Aguarde o envio desta lista antes de excluí-la.');
+  const response = await fetchWithAuthRetry(`/api/lists/${encodeURIComponent(listId)}`, { method: 'DELETE' });
+  const result = await readCatalogResponse<{
+    removedSources: number; updatedWorks: number; archivedWorks: number;
+  }>(response);
+  catalogCacheEpoch++;
+  return result;
 }
 
 export async function syncFavoritesToServer(myListIds: string[]): Promise<void> {

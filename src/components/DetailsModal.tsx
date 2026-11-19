@@ -261,7 +261,7 @@ export function DetailsModal({
         }
         onItemEnriched?.(enriched);
       }
-    });
+    }).catch((error) => console.warn('Falha ao atualizar a ficha do título.', error));
 
     return () => {
       cancelled = true;

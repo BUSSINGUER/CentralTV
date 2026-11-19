@@ -1,4 +1,5 @@
 import { drizzle } from 'drizzle-orm/node-postgres';
+import { sql } from 'drizzle-orm';
 import { Pool } from 'pg';
 import * as schema from './schema.ts';
 
@@ -43,6 +44,30 @@ const pool = createPool();
 
 export const pgDb = drizzle(pool, { schema });
 export type PgDatabase = typeof pgDb;
+type Transaction = Parameters<Parameters<typeof pgDb.transaction>[0]>[0];
+
+export async function lockCatalogWrites(tx: Transaction) {
+  // Shared by catalog writers, including workers on other instances.
+  await tx.execute(sql`select pg_advisory_xact_lock(187640, 1)`);
+}
+
+export function withCatalogWrite<T>(operation: (tx: Transaction) => Promise<T>) {
+  return executeWithDbRetry(() =>
+    pgDb.transaction(async (tx) => {
+      await lockCatalogWrites(tx);
+      return operation(tx);
+    })
+  );
+}
+
+function isDeadlock(error: unknown): boolean {
+  for (let depth = 0; depth < 5 && error && typeof error === 'object'; depth++) {
+    const current = error as { code?: string; cause?: unknown };
+    if (current.code === '40P01') return true;
+    error = current.cause;
+  }
+  return false;
+}
 
 function isConnectionError(err: unknown): boolean {
   if (!err) return false;
@@ -61,7 +86,7 @@ function isConnectionError(err: unknown): boolean {
 
 export async function executeWithDbRetry<T>(
   operation: () => Promise<T>,
-  maxRetries = 2
+  maxRetries = 3
 ): Promise<T> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -69,12 +94,12 @@ export async function executeWithDbRetry<T>(
       return await operation();
     } catch (err) {
       lastError = err;
-      if (attempt < maxRetries && isConnectionError(err)) {
+      const deadlock = isDeadlock(err);
+      if (attempt < maxRetries && (deadlock || isConnectionError(err))) {
         console.warn(
-          `[DB Retry] Connection error detected (attempt ${attempt}/${maxRetries}), retrying operation...`,
-          err instanceof Error ? err.message : err
+          `[DB Retry] ${deadlock ? '40P01' : 'Connection error'}; retrying transaction (${attempt}/${maxRetries}).`
         );
-        await new Promise((resolve) => setTimeout(resolve, 600 * attempt));
+        await new Promise((resolve) => setTimeout(resolve, 150 * attempt + Math.random() * 150));
         continue;
       }
       throw err;

@@ -215,6 +215,7 @@ export default function App() {
   );
 
   const usingRealVod = vodDbItems.length > 0;
+  const showDemoCatalog = !user && publishedDbItems.length === 0;
   const usingRealPublished = usingRealVod;
 
   // Strict total isolation:
@@ -224,23 +225,23 @@ export default function App() {
   // Live TV tab -> type === 'live' ONLY
   // Radio tab -> type === 'radio' ONLY
   const publishedMovies = useMemo(() => {
-    if (!usingRealVod) {
+    if (showDemoCatalog) {
       return INITIAL_CATALOG.filter((i) => i.type === 'movie');
     }
     return vodDbItems.filter((i) => i.type === 'movie');
-  }, [usingRealVod, vodDbItems]);
+  }, [showDemoCatalog, vodDbItems]);
 
   const publishedSeries = useMemo(() => {
-    if (!usingRealVod) {
+    if (showDemoCatalog) {
       return INITIAL_CATALOG.filter((i) => i.type === 'series');
     }
     return vodDbItems.filter((i) => i.type === 'series');
-  }, [usingRealVod, vodDbItems]);
+  }, [showDemoCatalog, vodDbItems]);
 
   const publishedVodCatalog = useMemo(() => {
-    if (!usingRealVod) return INITIAL_CATALOG;
+    if (showDemoCatalog) return INITIAL_CATALOG;
     return vodDbItems;
-  }, [usingRealVod, vodDbItems]);
+  }, [showDemoCatalog, vodDbItems]);
 
   const publishedLiveItems = useMemo(
     () => publishedDbItems.filter((i) => i.type === 'live'),
@@ -752,12 +753,8 @@ export default function App() {
           onSettingsUpdated={setSettings}
           onSelectItem={setModalItem}
           onBackHome={() => handleNavigate('home')}
-          onCatalogChanged={() => {
-            void loadPublishedCatalog();
-          }}
-          onEpgChanged={() => {
-            void loadEpg();
-          }}
+          onCatalogChanged={loadPublishedCatalog}
+          onEpgChanged={loadEpg}
         />
       )}
 

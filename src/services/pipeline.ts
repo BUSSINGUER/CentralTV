@@ -1,6 +1,6 @@
 import Hls from 'hls.js';
 import { db } from '../db/database';
-import { syncCatalogItemsToServer } from './persistenceSync';
+import { syncCatalogItemsToServer, syncWorkPatchToServer } from './persistenceSync';
 import {
   AppSettings,
   CatalogItem,
@@ -501,12 +501,15 @@ export async function runYoutubeSearchForItem(
         updatedAt: Date.now(),
       };
     }
+    if (res.ok && res.data) {
+      return { ...item, youtubeEnriched: true, updatedAt: Date.now() };
+    }
   } catch (err) {
     if ((err as Error)?.name === 'AbortError') throw err;
     // Keep empty trailer ID cleanly
   }
 
-  return { ...item, youtubeEnriched: true, updatedAt: Date.now() };
+  return item;
 }
 
 const onDemandEnrichmentRequests = new Map<string, Promise<CatalogItem>>();
@@ -533,18 +536,38 @@ export async function fetchAndCacheDetailsOnDemand(
       enriched = await runYoutubeSearchForItem(enriched, youtubeApiKey);
     }
 
-    const existing = await db.mediaItems.get(item.id);
-    const updatedItem = {
-      ...(existing || item),
-      ...enriched,
-      id: item.id,
-      sources: existing?.sources || item.sources,
-      episodes: existing?.episodes || item.episodes,
-      updatedAt: Date.now(),
+    const metadata: Partial<CatalogItem> = {
+      tmdbId: enriched.tmdbId,
+      title: enriched.title,
+      year: enriched.year,
+      synopsis: enriched.synopsis,
+      voteAverage: enriched.voteAverage,
+      genres: enriched.genres,
+      cast: enriched.cast,
+      director: enriched.director,
+      duration: enriched.duration,
+      durationSeconds: enriched.durationSeconds,
+      posterImage: enriched.posterImage,
+      backdropImage: enriched.backdropImage,
+      platform: enriched.platform,
+      youtubeTrailerId: enriched.youtubeTrailerId,
+      tmdbEnriched: enriched.tmdbEnriched,
+      youtubeEnriched: enriched.youtubeEnriched,
     };
-    await db.mediaItems.put(updatedItem);
-    await syncCatalogItemsToServer([updatedItem]);
-    return updatedItem;
+    for (const field of Object.keys(metadata) as Array<keyof CatalogItem>) {
+      if (metadata[field] === undefined || metadata[field] === item[field]) {
+        delete metadata[field];
+      }
+    }
+    if (Object.keys(metadata).length === 0) return item;
+    metadata.updatedAt = Date.now();
+    // Save only metadata. A stale details screen must not recreate a deleted list
+    // or replace newer sources and publication status.
+    if (await db.mediaItems.update(item.id, metadata)) {
+      await syncWorkPatchToServer(item.id, metadata).catch(() => {});
+    }
+    const current = await db.mediaItems.get(item.id);
+    return { ...item, ...metadata, ...current };
   })().finally(() => {
     onDemandEnrichmentRequests.delete(item.id);
   });
@@ -566,13 +589,14 @@ export async function processItemFullPipeline(
   throwIfAborted(signal);
 
   onStage?.('health');
-  let updated = await runHealthCheckForItem(
+  const updated = await runHealthCheckForItem(
     item,
     settings.probeTimeoutMs,
     signal
   );
 
   // TMDB and YouTube are intentionally deferred until the details page opens.
+  throwIfAborted(signal);
 
   await db.mediaItems.put(updated);
   if (!options?.skipServerSync) {

@@ -10,6 +10,7 @@ import { Readable } from 'stream';
 import { fileURLToPath } from 'url';
 import zlib from 'zlib';
 import {
+  CatalogConflictError,
   deleteListDecoupledFromPostgres,
   deleteServerInPostgres,
   dismissItemHistoryInPostgres,
@@ -19,8 +20,10 @@ import {
   listMigrationBackups,
   listServersFromPostgres,
   listWorksFromPostgres,
+  publishApprovedWorksInPostgres,
   migrateIndexedDbWithBackup,
   rollbackMigrationBackup,
+  resetActiveCatalogInPostgres,
   setUserFavoritesInPostgres,
   syncCatalogBatchToPostgres,
   updateServerSyncStatusInPostgres,
@@ -2147,8 +2150,6 @@ export async function createServer(httpServer?: http.Server) {
         reason: probe.reason,
       };
     },
-    enrichTmdb: enrichTmdbServer,
-    searchYoutube: searchYoutubeServer,
   });
   app.locals.taskRunner = taskRunner;
   httpServer?.on('close', () => {
@@ -2310,20 +2311,59 @@ export async function createServer(httpServer?: http.Server) {
       const body = (req.body || {}) as {
         items?: CatalogItem[];
         list?: M3uListRecord;
+        importListId?: string;
         mergeWithoutOverwrite?: boolean;
       };
       const result = await syncCatalogBatchToPostgres({
         items: Array.isArray(body.items) ? body.items : [],
         list: body.list,
+        importListId: body.importListId,
         mergeWithoutOverwrite: Boolean(body.mergeWithoutOverwrite),
       });
       res.json(result);
     } catch (error) {
+      if (error instanceof CatalogConflictError) {
+        res.status(409).json({ error: error.message });
+        return;
+      }
       console.error('POST /api/catalog/sync failed:', error);
       res.status(500).json({
         error:
           error instanceof Error ? error.message : 'Falha ao sincronizar catálogo.',
       });
+    }
+  });
+
+  app.post('/api/catalog/publish-approved', requireAuth, async (_req, res) => {
+    try {
+      const publishedCount = await publishApprovedWorksInPostgres();
+      res.json({ publishedCount });
+    } catch (error) {
+      console.error('POST /api/catalog/publish-approved failed:', error);
+      res.status(500).json({ error: 'Falha ao publicar os títulos aprovados.' });
+    }
+  });
+
+  app.post('/api/catalog/reset', requireAuth, async (req: AuthRequest, res) => {
+    const adminEmail = process.env.CATALOG_ADMIN_EMAIL?.trim().toLowerCase();
+    const user = req.user!;
+    if (user.admin !== true && (!adminEmail || !user.email_verified || user.email?.toLowerCase() !== adminEmail)) {
+      res.status(403).json({ error: 'Esta ação exige uma conta administradora do catálogo.' });
+      return;
+    }
+    if (req.body?.confirmation !== 'ZERAR CATÁLOGO') {
+      res.status(400).json({ error: 'Confirmação inválida para zerar o catálogo.' });
+      return;
+    }
+    try {
+      res.json(await resetActiveCatalogInPostgres());
+    } catch (error) {
+      if (error instanceof CatalogConflictError) {
+        res.status(409).json({ error: error.message });
+        return;
+      }
+      console.error('POST /api/catalog/reset failed:', error);
+      res.status(500).json({ error: 'Falha ao zerar o catálogo no servidor.' });
     }
   });
 
@@ -2341,6 +2381,10 @@ export async function createServer(httpServer?: http.Server) {
       });
       res.json({ ok: true });
     } catch (error) {
+      if (error instanceof CatalogConflictError) {
+        res.status(409).json({ error: error.message });
+        return;
+      }
       console.error('PATCH /api/catalog/works/:id failed:', error);
       res.status(500).json({
         error:

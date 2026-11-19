@@ -3,8 +3,10 @@ import crypto from 'node:crypto';
 import http from 'node:http';
 import test from 'node:test';
 import { createServer } from '../server.ts';
+import { executeWithDbRetry } from '../src/db/index.ts';
 import { db } from '../src/db/database';
 import {
+  fetchAndCacheDetailsOnDemand,
   processItemFullPipeline,
   runHealthCheckForItem,
   runTmdbEnrichmentForItem,
@@ -56,9 +58,11 @@ function makeBaseItem(
   };
 }
 
-test('Series with episode sources skips episode probing and enriches TMDB + YouTube directly', async () => {
+test('Series is checked without external lookups and enriched when opening its details', async () => {
   const originalFetch = globalThis.fetch;
   const originalPut = db.mediaItems.put.bind(db.mediaItems);
+  const originalUpdate = db.mediaItems.update;
+  const originalGet = db.mediaItems.get;
   const savedItems: CatalogItem[] = [];
   const calledUrls: string[] = [];
 
@@ -68,6 +72,11 @@ test('Series with episode sources skips episode probing and enriches TMDB + YouT
     savedItems.push(item);
     return item.id;
   };
+  db.mediaItems.update = (async (_key: string, changes: Partial<CatalogItem>) => {
+    Object.assign(savedItems[0], changes);
+    return 1;
+  }) as typeof originalUpdate;
+  db.mediaItems.get = (async () => savedItems[0]) as unknown as typeof originalGet;
 
   globalThis.fetch = (async (input: RequestInfo | URL) => {
     const urlStr = String(input);
@@ -130,19 +139,30 @@ test('Series with episode sources skips episode probing and enriches TMDB + YouT
 
     const processed = await processItemFullPipeline(seriesItem, TEST_SETTINGS);
     assert.equal(processed.status, 'aprovado');
-    assert.equal(processed.tmdbEnriched, true);
-    assert.equal(processed.tmdbId, 94997);
-    assert.equal(processed.platform, 'hbo');
-    assert.equal(processed.youtubeTrailerId, 'DotnJ7tTA34');
-    assert.equal(calledUrls.some((u) => u.includes('/api/check-stream')), false);
+    assert.equal(processed.tmdbEnriched, false);
+    assert.equal(processed.youtubeTrailerId, '');
+    assert.deepEqual(calledUrls, []);
+    const [details, duplicate] = await Promise.all([
+      fetchAndCacheDetailsOnDemand(processed, 'tmdb', 'yt'),
+      fetchAndCacheDetailsOnDemand(processed, 'tmdb', 'yt'),
+    ]);
+    assert.equal(details.tmdbId, 94997);
+    assert.equal(details.platform, 'hbo');
+    assert.equal(details.youtubeTrailerId, 'DotnJ7tTA34');
+    assert.equal(details.status, 'aprovado');
+    assert.equal(details, duplicate);
+    await fetchAndCacheDetailsOnDemand(details, 'tmdb', 'yt');
+    assert.equal(calledUrls.length, 2);
     assert.equal(savedItems.length, 1);
   } finally {
     globalThis.fetch = originalFetch;
+    db.mediaItems.update = originalUpdate;
+    db.mediaItems.get = originalGet;
     (db.mediaItems as unknown as { put: typeof originalPut }).put = originalPut;
   }
 });
 
-test('CORS/Proxy blocked pendente item keeps status pendente and still enriches TMDB + YouTube', async () => {
+test('CORS/Proxy blocked item stays pending with no external metadata', async () => {
   const originalFetch = globalThis.fetch;
   const originalPut = db.mediaItems.put.bind(db.mediaItems);
   const savedItems: CatalogItem[] = [];
@@ -205,9 +225,9 @@ test('CORS/Proxy blocked pendente item keeps status pendente and still enriches 
     const processed = await processItemFullPipeline(corsMovie, TEST_SETTINGS);
     assert.equal(processed.status, 'pendente');
     assert.equal(processed.healthChecked, true);
-    assert.equal(processed.tmdbEnriched, true);
-    assert.equal(processed.tmdbId, 693134);
-    assert.equal(processed.youtubeTrailerId, 'U2Qp5pL3ovA');
+    assert.equal(processed.tmdbEnriched, false);
+    assert.equal(processed.tmdbId, undefined);
+    assert.equal(processed.youtubeTrailerId, '');
     assert.equal(savedItems.length, 1);
   } finally {
     globalThis.fetch = originalFetch;
@@ -278,8 +298,9 @@ test('TMDB HTTP 429 retries cleanly and API errors never crash item pipeline', a
     tmdbAttempts = 0;
     const processed = await processItemFullPipeline(movie, TEST_SETTINGS);
     assert.equal(processed.status, 'aprovado');
-    assert.equal(processed.tmdbEnriched, true);
-    assert.equal(processed.youtubeEnriched, true);
+    assert.equal(processed.tmdbEnriched, false);
+    assert.equal(processed.youtubeEnriched, false);
+    assert.equal(tmdbAttempts, 0);
   } finally {
     globalThis.fetch = originalFetch;
     (db.mediaItems as unknown as { put: typeof originalPut }).put = originalPut;
@@ -320,6 +341,18 @@ test('Pipeline honors AbortSignal cancellation without writing partial records',
   }
 });
 
+test('Retries a transaction when Drizzle wraps a PostgreSQL deadlock', async () => {
+  let attempts = 0;
+  const result = await executeWithDbRetry(async () => {
+    if (++attempts === 1) {
+      throw new Error('Failed query', { cause: { code: '40P01' } });
+    }
+    return 'confirmed';
+  });
+  assert.equal(result, 'confirmed');
+  assert.equal(attempts, 2);
+});
+
 test('Vite dev server attaches HMR WebSocket to the same HTTP port and accepts preview host upgrades', async () => {
   const httpServer = http.createServer();
   const app = await createServer(httpServer);
@@ -333,6 +366,8 @@ test('Vite dev server attaches HMR WebSocket to the same HTTP port and accepts p
     const addr = httpServer.address();
     assert.ok(addr && typeof addr === 'object');
     const port = addr.port;
+    const reset = await fetch(`http://127.0.0.1:${port}/api/catalog/reset`, { method: 'POST' });
+    assert.equal(reset.status, 401);
 
     const clientResp = await fetch(`http://127.0.0.1:${port}/@vite/client`);
     assert.equal(clientResp.status, 200);

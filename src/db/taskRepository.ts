@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { and, asc, desc, eq, inArray } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import type {
   CatalogItem,
   MediaFormatBadge,
@@ -15,7 +15,7 @@ import type {
   SourceValidationState,
 } from '../types/streaming.ts';
 import { sortAndRelabelSourcesList } from '../utils/identity.ts';
-import { pgDb } from './index.ts';
+import { pgDb, withCatalogWrite } from './index.ts';
 import {
   episodes,
   processingTasks,
@@ -109,7 +109,7 @@ export async function createOrEnqueueProcessingTask(params: {
       : 'all_pending';
 
   try {
-    return await pgDb.transaction(async (tx) => {
+    return await withCatalogWrite(async (tx) => {
       const openRows = await tx
         .select()
         .from(processingTasks)
@@ -643,54 +643,36 @@ export async function getHydratedWorkByIdFromPostgres(
 }
 
 export async function saveProcessedWorkResultInPostgres(
-  item: CatalogItem
-): Promise<void> {
+  item: CatalogItem,
+  previousStatus: PublishStatus
+): Promise<PublishStatus | null> {
   const now = Date.now();
   try {
-    await pgDb.transaction(async (tx) => {
-      await tx
+    return await withCatalogWrite(async (tx) => {
+      const [updated] = await tx
         .update(works)
         .set({
-          status: item.status || 'pendente',
+          status: sql`case when ${works.status} = ${previousStatus}
+            then ${item.status || 'pendente'} else ${works.status} end`,
           healthChecked: Boolean(item.healthChecked),
-          tmdbId: item.tmdbId ?? null,
-          title: item.title,
-          year: item.year,
           lastError: item.lastError ?? null,
           updatedAt: now,
         })
-        .where(eq(works.id, item.id));
-
-      await tx
-        .update(workMetadata)
-        .set({
-          synopsis: item.synopsis || '',
-          voteAverage: item.voteAverage ?? null,
-          genresJson: JSON.stringify(item.genres || []),
-          castJson: JSON.stringify(item.cast || []),
-          director: item.director || '',
-          duration: item.duration || '',
-          durationSeconds: item.durationSeconds || 7200,
-          posterImage: item.posterImage || '',
-          backdropImage: item.backdropImage || '',
-          platform: item.platform || 'netflix',
-          youtubeTrailerId: item.youtubeTrailerId || '',
-          tmdbEnriched: Boolean(item.tmdbEnriched),
-          youtubeEnriched: Boolean(item.youtubeEnriched),
-          enrichedAt: item.tmdbEnriched ? now : null,
-          updatedAt: now,
-        })
-        .where(eq(workMetadata.workId, item.id));
+        .where(and(eq(works.id, item.id), eq(works.archived, false)))
+        .returning({ status: works.status });
+      if (!updated) return null;
 
       for (const src of item.sources || []) {
-        await tx
+        const [source] = await tx
           .update(sources)
           .set({
             resolvedUrl: src.resolvedUrl ?? null,
             detectedFormat: src.detectedFormat ?? null,
             updatedAt: now,
           })
-          .where(eq(sources.id, src.id));
+          .where(and(eq(sources.id, src.id), eq(sources.workId, item.id)))
+          .returning({ id: sources.id });
+        if (!source) continue;
 
         const existingAvail = await tx
           .select({ sourceId: sourceAvailability.sourceId })
@@ -724,6 +706,7 @@ export async function saveProcessedWorkResultInPostgres(
             .where(eq(sourceAvailability.sourceId, src.id));
         }
       }
+      return updated.status as PublishStatus;
     });
   } catch (error) {
     console.error('Failed to persist processed work result:', error);

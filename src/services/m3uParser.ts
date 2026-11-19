@@ -5,7 +5,10 @@ import {
 } from './streamOrigins';
 import {
   deleteListOnServer,
+  pullAuthoritativeStateFromServer,
+  resumeCatalogListUpload,
   syncCatalogItemsToServer,
+  withLocalCatalogImport,
 } from './persistenceSync';
 import {
   buildProvisionalKey,
@@ -35,6 +38,7 @@ export interface M3UImportStats {
   ignoredDuplicates: number;
   byKind: Record<MediaKind, number>;
   touchedItemIds?: string[];
+  syncError?: string;
 }
 
 export interface M3UImportOptions {
@@ -43,6 +47,14 @@ export interface M3UImportOptions {
   xtreamCredentials?: XtreamCredentials;
   onProgress?: (stats: M3UImportStats) => void;
   signal?: AbortSignal;
+}
+
+async function importAndRefreshCatalog(operation: () => Promise<M3UImportStats>) {
+  const result = await withLocalCatalogImport(operation);
+  if (!result.syncError) {
+    await pullAuthoritativeStateFromServer().catch(() => {});
+  }
+  return result;
 }
 
 interface ParsedExtInf {
@@ -666,7 +678,7 @@ export async function importM3UFromStream(
     }
 
     const existingSources = item.sources ?? [];
-    const alreadyHasUrl = existingSources.some((s) => s.url === line);
+    const alreadyHasUrl = existingSources.some((s) => s.url === line && s.listId === listId);
 
     if (alreadyHasUrl) {
       // Caso 1: Título já existe e URL exata já cadastrada -> ignora duplicata sem rebaixar status
@@ -705,7 +717,7 @@ export async function importM3UFromStream(
       );
 
       if (existingEp) {
-        if (existingEp.sources.some((s) => s.url === line)) {
+        if (existingEp.sources.some((s) => s.url === line && s.listId === listId)) {
           if (alreadyHasUrl && !isBrandNewItem) {
             stats.ignoredDuplicates += 1;
           }
@@ -1037,6 +1049,7 @@ export async function deleteM3uList(listId: string): Promise<{
   updatedItems: number;
   removedSources: number;
 }> {
+  const server = await deleteListOnServer(listId);
   const allItems = await db.mediaItems.toArray();
   const itemsToUpdate: CatalogItem[] = [];
   let archivedItems = 0;
@@ -1115,17 +1128,17 @@ export async function deleteM3uList(listId: string): Promise<{
     }
   }
 
-  if (itemsToUpdate.length > 0) {
-    await db.mediaItems.bulkPut(itemsToUpdate);
-  }
-  await db.m3u_lists.delete(listId);
-  await deleteListOnServer(listId);
+  await db.transaction('rw', db.mediaItems, db.m3u_lists, db.pendingCatalogImports, async () => {
+    if (itemsToUpdate.length > 0) await db.mediaItems.bulkPut(itemsToUpdate);
+    await db.m3u_lists.delete(listId);
+    await db.pendingCatalogImports.delete(listId);
+  });
 
   return {
     removedItems: archivedItems,
-    archivedItems,
-    updatedItems,
-    removedSources,
+    archivedItems: Math.max(archivedItems, server.archivedWorks),
+    updatedItems: Math.max(updatedItems, server.updatedWorks),
+    removedSources: Math.max(removedSources, server.removedSources),
   };
 }
 
@@ -1143,7 +1156,8 @@ async function persistListSummary(
   name: string,
   sourceType: M3uListRecord['sourceType'],
   sourceLocation?: string,
-  xtreamCredentials?: XtreamCredentials
+  xtreamCredentials?: XtreamCredentials,
+  signal?: AbortSignal
 ) {
   const record: M3uListRecord = {
     id: stats.listId,
@@ -1157,16 +1171,17 @@ async function persistListSummary(
     mergedSourcesCount: stats.mergedSources,
     ignoredDuplicatesCount: stats.ignoredDuplicates,
   };
-  await saveM3uListRecord(record);
-
-  const touchedIds = stats.touchedItemIds || [];
-  const touchedItems =
-    touchedIds.length > 0
-      ? (await db.mediaItems.bulkGet(touchedIds)).filter((it): it is CatalogItem =>
-          Boolean(it)
-        )
-      : [];
-  await syncCatalogItemsToServer(touchedItems, record, false);
+  await db.transaction('rw', db.m3u_lists, db.pendingCatalogImports, async () => {
+    await saveM3uListRecord(record);
+    await db.pendingCatalogImports.put({ id: record.id, itemIds: stats.touchedItemIds || [], cursor: 0 });
+  });
+  try {
+    await resumeCatalogListUpload(record, signal);
+  } catch (error) {
+    stats.syncError = error instanceof Error && error.name !== 'AbortError'
+      ? error.message
+      : 'Envio interrompido.';
+  }
 }
 
 export function normalizeServerUrl(rawServerUrl: string): string {
@@ -1623,7 +1638,7 @@ export async function importCatalogFromJson(
       item.archived = false;
     }
     const existingSources = item.sources ?? [];
-    const alreadyHasUrl = existingSources.some((s) => s.url === entry.url);
+    const alreadyHasUrl = existingSources.some((s) => s.url === entry.url && s.listId === listId);
 
     if (alreadyHasUrl) {
       if (!isBrandNewItem && !(mediaKind === 'series' && episodeInfo)) {
@@ -1660,7 +1675,7 @@ export async function importCatalogFromJson(
       );
 
       if (existingEp) {
-        if (existingEp.sources.some((s) => s.url === entry.url)) {
+        if (existingEp.sources.some((s) => s.url === entry.url && s.listId === listId)) {
           if (alreadyHasUrl && !isBrandNewItem) {
             stats.ignoredDuplicates += 1;
           }
@@ -1739,6 +1754,13 @@ export async function importM3UFromFile(
   file: File,
   options: M3UImportOptions = {}
 ): Promise<M3UImportStats> {
+  return importAndRefreshCatalog(() => importM3UFile(file, options));
+}
+
+async function importM3UFile(
+  file: File,
+  options: M3UImportOptions = {}
+): Promise<M3UImportStats> {
   const listId = options.listId || `list-${crypto.randomUUID().slice(0, 10)}`;
   const mergedOptions: M3UImportOptions = { ...options, listId };
 
@@ -1771,12 +1793,19 @@ export async function importM3UFromFile(
     stats,
     options.customName?.trim() || file.name,
     'file',
-    file.name
+    file.name, undefined, options.signal
   );
   return stats;
 }
 
 export async function importM3UFromText(
+  text: string,
+  options: M3UImportOptions = {}
+): Promise<M3UImportStats> {
+  return importAndRefreshCatalog(() => importM3UText(text, options));
+}
+
+async function importM3UText(
   text: string,
   options: M3UImportOptions = {}
 ): Promise<M3UImportStats> {
@@ -1796,12 +1825,19 @@ export async function importM3UFromText(
   await persistListSummary(
     stats,
     options.customName?.trim() || 'Lista Exemplo M3U',
-    'sample'
+    'sample', undefined, undefined, options.signal
   );
   return stats;
 }
 
 export async function importM3UFromUrl(
+  url: string,
+  options: M3UImportOptions = {}
+): Promise<M3UImportStats> {
+  return importAndRefreshCatalog(() => importM3UUrl(url, options));
+}
+
+async function importM3UUrl(
   url: string,
   options: M3UImportOptions = {}
 ): Promise<M3UImportStats> {
@@ -1909,7 +1945,7 @@ export async function importM3UFromUrl(
       stats,
       options.customName?.trim() || `${buildServerDisplayName(cleanUrl)} (JSON)`,
       'json',
-      cleanUrl
+      cleanUrl, undefined, options.signal
     );
     return stats;
   }
@@ -1966,7 +2002,8 @@ export async function importM3UFromUrl(
     options.customName?.trim() || defaultName,
     isXtream ? 'xtream' : 'url',
     locationToSave,
-    options.xtreamCredentials
+    options.xtreamCredentials,
+    options.signal
   );
   return stats;
 }

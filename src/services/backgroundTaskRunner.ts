@@ -61,18 +61,6 @@ export interface BackgroundRunnerDeps {
     timeoutMs: number,
     signal?: AbortSignal
   ) => Promise<ServerProbeResult>;
-  enrichTmdb: (params: {
-    title: string;
-    year?: number;
-    type: string;
-    tmdbApiKey?: string;
-    signal?: AbortSignal;
-  }) => Promise<ServerTmdbEnrichResult>;
-  searchYoutube: (params: {
-    query: string;
-    youtubeApiKey?: string;
-    signal?: AbortSignal;
-  }) => Promise<ServerYoutubeSearchResult>;
 }
 
 async function mapWithConcurrency<T, R>(
@@ -312,7 +300,7 @@ export class BackgroundTaskRunner {
             }
 
             const work = await getHydratedWorkByIdFromPostgres(workId);
-            if (!work) {
+            if (!work || work.archived) {
               sliceOutcomes[offset] = { outcome: 'skipped' };
               return;
             }
@@ -328,11 +316,7 @@ export class BackgroundTaskRunner {
             try {
               const processed = await this.processSingleWork(
                 work,
-                {
-                  probeTimeoutMs,
-                  tmdbApiKey: settings.tmdbApiKey,
-                  youtubeApiKey: settings.youtubeApiKey,
-                },
+                probeTimeoutMs,
                 controller.signal,
                 (stage, note) => {
                   if (offset === 0 && !controller.signal.aborted && !this.shuttingDown) {
@@ -346,9 +330,17 @@ export class BackgroundTaskRunner {
                 }
               );
 
-              await saveProcessedWorkResultInPostgres(processed.item);
-
-              const st = processed.item.status || 'pendente';
+              if (controller.signal.aborted) {
+                sliceOutcomes[offset] = { outcome: 'aborted' };
+                return;
+              }
+              const st = await saveProcessedWorkResultInPostgres(
+                processed.item, work.status || 'pendente'
+              );
+              if (!st) {
+                sliceOutcomes[offset] = { outcome: 'skipped' };
+                return;
+              }
               const outcome: SliceOutcome['outcome'] =
                 st === 'aprovado' || st === 'publicado'
                   ? 'approved'
@@ -375,7 +367,7 @@ export class BackgroundTaskRunner {
                 lastError: errMsg,
                 updatedAt: Date.now(),
               };
-              await saveProcessedWorkResultInPostgres(errored).catch(() => {});
+              await saveProcessedWorkResultInPostgres(errored, work.status || 'pendente').catch(() => {});
               sliceOutcomes[offset] = {
                 outcome: 'failed',
                 title: work.title,
@@ -462,11 +454,7 @@ export class BackgroundTaskRunner {
 
   private async processSingleWork(
     item: CatalogItem,
-    config: {
-      probeTimeoutMs: number;
-      tmdbApiKey?: string;
-      youtubeApiKey?: string;
-    },
+    probeTimeoutMs: number,
     signal: AbortSignal,
     onStage: (stage: ProcessingTaskStage, note?: string) => void
   ): Promise<{ item: CatalogItem; note?: string }> {
@@ -475,28 +463,8 @@ export class BackgroundTaskRunner {
     }
 
     onStage('health');
-    let updated = await this.runHealthCheck(item, config.probeTimeoutMs, signal);
-    let note: string | undefined = updated.lastError;
-
-    if (signal.aborted) {
-      throw new DOMException('Aborted', 'AbortError');
-    }
-
-    onStage('tmdb', note);
-    const tmdbRes = await this.runTmdbEnrich(updated, config.tmdbApiKey, signal);
-    updated = tmdbRes.item;
-    if (tmdbRes.note) {
-      note = note ? `${note} | ${tmdbRes.note}` : tmdbRes.note;
-    }
-
-    if (signal.aborted) {
-      throw new DOMException('Aborted', 'AbortError');
-    }
-
-    onStage('youtube', note);
-    updated = await this.runYoutubeEnrich(updated, config.youtubeApiKey, signal);
-
-    return { item: updated, note };
+    const updated = await this.runHealthCheck(item, probeTimeoutMs, signal);
+    return { item: updated, note: updated.lastError };
   }
 
   private async runHealthCheck(
@@ -506,7 +474,7 @@ export class BackgroundTaskRunner {
   ): Promise<CatalogItem> {
     const sources = item.sources ?? [];
 
-    // Series store stream links inside episodes[]; enrich TMDB/YouTube directly without probing all episodes
+    // Series with episode sources do not need to probe every episode.
     if (item.type === 'series' && sources.length === 0) {
       const hasEpisodeSources = (item.episodes ?? []).some(
         (ep) => (ep.sources?.length ?? 0) > 0
@@ -604,105 +572,4 @@ export class BackgroundTaskRunner {
     };
   }
 
-  private async runTmdbEnrich(
-    item: CatalogItem,
-    tmdbApiKey: string | undefined,
-    signal: AbortSignal
-  ): Promise<{ item: CatalogItem; note?: string }> {
-    if (item.type === 'live' || item.type === 'radio') {
-      return {
-        item: { ...item, tmdbEnriched: true, updatedAt: Date.now() },
-      };
-    }
-    if (item.tmdbEnriched && item.tmdbId) {
-      return { item };
-    }
-
-    try {
-      const data = await this.deps.enrichTmdb({
-        title: item.title,
-        year: item.year,
-        type: item.type,
-        tmdbApiKey,
-        signal,
-      });
-
-      if (data.missingKey) {
-        return {
-          item: { ...item, updatedAt: Date.now() },
-          note: 'TMDB API Key ausente — mantendo dados do M3U.',
-        };
-      }
-
-      if (!data.found) {
-        return {
-          item: { ...item, tmdbEnriched: false, updatedAt: Date.now() },
-          note: data.error || 'Título não encontrado no TMDB.',
-        };
-      }
-
-      return {
-        item: {
-          ...item,
-          tmdbId: data.tmdbId,
-          title: data.title || item.title,
-          year: data.year || item.year,
-          synopsis: data.synopsis || item.synopsis,
-          voteAverage: data.voteAverage ?? item.voteAverage,
-          genres:
-            data.genres && data.genres.length > 0 ? data.genres : item.genres,
-          cast: data.cast && data.cast.length > 0 ? data.cast : item.cast,
-          director: data.director || item.director,
-          duration: data.duration || item.duration,
-          durationSeconds: data.durationSeconds || item.durationSeconds,
-          posterImage: data.posterImage || item.posterImage,
-          backdropImage: data.backdropImage || item.backdropImage,
-          platform: data.platform || item.platform,
-          youtubeTrailerId: data.youtubeTrailerId || item.youtubeTrailerId,
-          tmdbEnriched: true,
-          updatedAt: Date.now(),
-        },
-      };
-    } catch (err) {
-      if (isAbortLikeError(err)) throw err;
-      return {
-        item,
-        note: err instanceof Error ? err.message : 'Erro ao consultar TMDB.',
-      };
-    }
-  }
-
-  private async runYoutubeEnrich(
-    item: CatalogItem,
-    youtubeApiKey: string | undefined,
-    signal: AbortSignal
-  ): Promise<CatalogItem> {
-    if (item.type === 'live' || item.type === 'radio') {
-      return { ...item, youtubeEnriched: true, updatedAt: Date.now() };
-    }
-    if (item.youtubeTrailerId) {
-      return { ...item, youtubeEnriched: true, updatedAt: Date.now() };
-    }
-
-    const query = `${item.title} ${item.year || ''} trailer oficial dublado`.trim();
-    try {
-      const data = await this.deps.searchYoutube({
-        query,
-        youtubeApiKey,
-        signal,
-      });
-      if (data.videoId) {
-        return {
-          ...item,
-          youtubeTrailerId: data.videoId,
-          youtubeEnriched: true,
-          updatedAt: Date.now(),
-        };
-      }
-    } catch (err) {
-      if (isAbortLikeError(err)) throw err;
-    }
-
-    return { ...item, youtubeEnriched: true, updatedAt: Date.now() };
-  }
 }
