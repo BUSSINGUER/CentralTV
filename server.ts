@@ -1,7 +1,9 @@
 import 'dotenv/config';
+import crypto from 'crypto';
 import dns from 'dns/promises';
 import express from 'express';
 import fs from 'fs';
+import http from 'http';
 import net from 'net';
 import path from 'path';
 import { Readable } from 'stream';
@@ -9,6 +11,7 @@ import { fileURLToPath } from 'url';
 import zlib from 'zlib';
 import {
   deleteListDecoupledFromPostgres,
+  deleteServerInPostgres,
   dismissItemHistoryInPostgres,
   getUserFavoritesFromPostgres,
   getUserWatchHistoryFromPostgres,
@@ -18,15 +21,15 @@ import {
   listWorksFromPostgres,
   migrateIndexedDbWithBackup,
   rollbackMigrationBackup,
-  ServerRecord,
   setUserFavoritesInPostgres,
   syncCatalogBatchToPostgres,
   updateServerSyncStatusInPostgres,
   updateWorkStatusOrDeleteInPostgres,
   upsertServerInPostgres,
   upsertUserWatchHistoryInPostgres,
+  type ServerRecord,
 } from './src/db/catalogRepository.ts';
-import { AuthRequest, requireAuth } from './src/middleware/auth.ts';
+import { requireAuth, type AuthRequest } from './src/middleware/auth.ts';
 import type {
   CatalogItem,
   M3uListRecord,
@@ -578,7 +581,7 @@ function isValidHttpUrl(rawUrl: string): boolean {
   }
 }
 
-export async function createServer() {
+export async function createServer(httpServer?: http.Server) {
   const app = express();
   app.use(express.json({ limit: '25mb' }));
 
@@ -1626,7 +1629,11 @@ export async function createServer() {
         signal: AbortSignal.timeout(10000),
       });
       if (!resp.ok) {
-        throw new Error(`TMDB HTTP ${resp.status}`);
+        const err = new Error(`TMDB HTTP ${resp.status}`) as Error & {
+          statusCode?: number;
+        };
+        err.statusCode = resp.status;
+        throw err;
       }
       return resp.json() as Promise<Record<string, unknown>>;
     };
@@ -1783,7 +1790,12 @@ export async function createServer() {
         youtubeTrailerId: ytVideo?.key,
       });
     } catch (err) {
-      res.status(502).json({
+      const upstreamStatus = (err as { statusCode?: number })?.statusCode;
+      const status =
+        upstreamStatus === 429 || upstreamStatus === 401
+          ? upstreamStatus
+          : 502;
+      res.status(status).json({
         error: err instanceof Error ? err.message : 'Erro na API do TMDB.',
       });
     }
@@ -2485,9 +2497,23 @@ export async function createServer() {
 
   if (!isProduction) {
     const { createServer: createViteServer } = await import('vite');
+    const hmrEnabled = process.env.DISABLE_HMR !== 'true';
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        allowedHosts: ['localhost', '127.0.0.1', '.run.app'],
+        hmr: hmrEnabled,
+        ws: hmrEnabled
+          ? httpServer
+            ? { server: httpServer }
+            : undefined
+          : false,
+      },
       appType: 'spa',
+    });
+    app.locals.vite = vite;
+    httpServer?.on('close', () => {
+      void vite.close();
     });
     app.use(vite.middlewares);
   } else {
@@ -2513,11 +2539,22 @@ const isDirectExecution =
   path.resolve(process.argv[1]) === path.resolve(__filename);
 
 if (isDirectExecution) {
-  createServer()
+  const httpServer = http.createServer();
+  createServer(httpServer)
     .then((app) => {
-      app.listen(PORT, '0.0.0.0', () => {
+      httpServer.on('request', app);
+      httpServer.listen(PORT, '0.0.0.0', () => {
         console.log(`Aura Stream server running at http://localhost:${PORT}`);
       });
+
+      const shutdown = () => {
+        httpServer.close(() => {
+          process.exit(0);
+        });
+        setTimeout(() => process.exit(0), 3000).unref();
+      };
+      process.once('SIGINT', shutdown);
+      process.once('SIGTERM', shutdown);
     })
     .catch((err) => {
       console.error('Failed to start server:', err);

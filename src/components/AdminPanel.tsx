@@ -326,10 +326,14 @@ export function AdminPanel({
     processed: 0,
     total: 0,
     approved: 0,
+    pendingCors: 0,
     offline: 0,
+    failed: 0,
     currentTitle: '',
     currentStage: 'health',
   });
+  const pipelineRunningRef = useRef(false);
+  const pipelineAbortRef = useRef<AbortController | null>(null);
   const pauseFlagRef = useRef(false);
   const cancelFlagRef = useRef(false);
   const [busyItemId, setBusyItemId] = useState<string | null>(null);
@@ -350,24 +354,37 @@ export function AdminPanel({
   const [settingsSavedMsg, setSettingsSavedMsg] = useState(false);
 
   const refreshItems = async () => {
-    const [all, epg, lists, backups] = await Promise.all([
-      db.mediaItems.orderBy('createdAt').reverse().toArray(),
-      getAllEpgPrograms(),
-      getAllM3uLists(),
-      user ? fetchMigrationBackups() : Promise.resolve([]),
-    ]);
-    setItems(all.filter((it) => !it.archived));
-    setArchivedCount(all.filter((it) => Boolean(it.archived)).length);
-    setEpgCount(epg.length);
-    setM3uLists(lists);
-    setMigrationBackups(backups);
-    setLoadingDb(false);
-    onCatalogChanged();
+    try {
+      const [all, epg, lists, backups] = await Promise.all([
+        db.mediaItems.orderBy('createdAt').reverse().toArray(),
+        getAllEpgPrograms(),
+        getAllM3uLists(),
+        user ? fetchMigrationBackups() : Promise.resolve([]),
+      ]);
+      setItems(all.filter((it) => !it.archived));
+      setArchivedCount(all.filter((it) => Boolean(it.archived)).length);
+      setEpgCount(epg.length);
+      setM3uLists(lists);
+      setMigrationBackups(backups);
+      onCatalogChanged();
+    } catch (err) {
+      console.error('Failed to refresh admin items:', err);
+    } finally {
+      setLoadingDb(false);
+    }
   };
 
   useEffect(() => {
     void refreshItems();
   }, [user]);
+
+  useEffect(() => {
+    return () => {
+      cancelFlagRef.current = true;
+      pauseFlagRef.current = false;
+      pipelineAbortRef.current?.abort();
+    };
+  }, []);
 
   useEffect(() => {
     setActiveTab(initialTab);
@@ -699,17 +716,24 @@ export function AdminPanel({
 
   // Pipeline Batch Processing
   const handleRunBatchPipeline = async () => {
+    if (pipelineRunningRef.current) return;
+
     const pendingItems = items.filter(
       (i) => (i.status || 'pendente') === 'pendente'
     );
     if (pendingItems.length === 0) return;
 
+    pipelineRunningRef.current = true;
     pauseFlagRef.current = false;
     cancelFlagRef.current = false;
+    const abortController = new AbortController();
+    pipelineAbortRef.current = abortController;
 
     let processed = 0;
     let approved = 0;
+    let pendingCors = 0;
     let offline = 0;
+    let failed = 0;
 
     setPipeline({
       running: true,
@@ -717,61 +741,143 @@ export function AdminPanel({
       processed: 0,
       total: pendingItems.length,
       approved: 0,
+      pendingCors: 0,
       offline: 0,
+      failed: 0,
       currentTitle: pendingItems[0].title,
       currentStage: 'health',
+      lastNote: undefined,
     });
 
-    const chunkSize = Math.max(1, settings.batchSize || 4);
+    const chunkSize = Math.min(12, Math.max(1, settings.batchSize || 4));
 
-    for (let i = 0; i < pendingItems.length; i += chunkSize) {
-      if (cancelFlagRef.current) break;
-
-      while (pauseFlagRef.current) {
+    try {
+      for (let i = 0; i < pendingItems.length; i += chunkSize) {
         if (cancelFlagRef.current) break;
-        await new Promise((r) => setTimeout(r, 250));
-      }
-      if (cancelFlagRef.current) break;
 
-      const batch = pendingItems.slice(i, i + chunkSize);
+        while (pauseFlagRef.current) {
+          if (cancelFlagRef.current) break;
+          await new Promise((r) => setTimeout(r, 250));
+        }
+        if (cancelFlagRef.current) break;
 
-      await Promise.all(
-        batch.map(async (item) => {
-          const updated = await processItemFullPipeline(
-            item,
-            settings,
-            (stage, note) => {
+        const batch = pendingItems.slice(i, i + chunkSize);
+        const chunkResults = await Promise.allSettled(
+          batch.map(async (item) => {
+            if (cancelFlagRef.current || abortController.signal.aborted) {
+              return null;
+            }
+            try {
+              const updated = await processItemFullPipeline(
+                item,
+                settings,
+                (stage, note) => {
+                  setPipeline((prev) => ({
+                    ...prev,
+                    currentTitle: item.title,
+                    currentStage: stage,
+                    lastNote: note || prev.lastNote,
+                  }));
+                },
+                {
+                  signal: abortController.signal,
+                  skipServerSync: true,
+                }
+              );
+
+              processed += 1;
+              if (updated.status === 'aprovado') approved += 1;
+              else if (updated.status === 'offline') offline += 1;
+              else if (updated.status === 'pendente') pendingCors += 1;
+
               setPipeline((prev) => ({
                 ...prev,
-                currentTitle: item.title,
-                currentStage: stage,
-                lastNote: note || prev.lastNote,
+                processed,
+                approved,
+                pendingCors,
+                offline,
+                failed,
               }));
+
+              return updated;
+            } catch (err) {
+              if ((err as Error)?.name === 'AbortError') {
+                return null;
+              }
+              failed += 1;
+              processed += 1;
+              const errMsg =
+                err instanceof Error
+                  ? err.message
+                  : 'Erro inesperado ao processar item.';
+              console.error(
+                `[Pipeline] Falha ao processar "${item.title}":`,
+                err
+              );
+              const erroredItem: CatalogItem = {
+                ...item,
+                lastError: errMsg,
+                updatedAt: Date.now(),
+              };
+              await db.mediaItems.put(erroredItem).catch(() => {});
+              setPipeline((prev) => ({
+                ...prev,
+                processed,
+                failed,
+                lastNote: `Falha em "${item.title}": ${errMsg}`,
+              }));
+              return erroredItem;
             }
-          );
+          })
+        );
 
-          processed += 1;
-          if (updated.status === 'aprovado') approved += 1;
-          else if (updated.status === 'offline') offline += 1;
+        const updatedItems = chunkResults
+          .map((res) => (res.status === 'fulfilled' ? res.value : null))
+          .filter((val): val is CatalogItem => Boolean(val));
 
-          setPipeline((prev) => ({
-            ...prev,
-            processed,
-            approved,
-            offline,
-          }));
-        })
-      );
+        if (updatedItems.length > 0) {
+          const updatedById = new Map(updatedItems.map((u) => [u.id, u]));
+          setItems((prev) => prev.map((it) => updatedById.get(it.id) || it));
 
+          const syncRes = await syncCatalogItemsToServer(updatedItems);
+          if (!syncRes.synced && syncRes.error) {
+            setPipeline((prev) => ({
+              ...prev,
+              lastNote: `Salvo localmente; aviso na nuvem: ${syncRes.error}`,
+            }));
+          }
+        }
+
+        // Yield briefly between batches to keep UI responsive and avoid API burst limits
+        if (i + chunkSize < pendingItems.length && !cancelFlagRef.current) {
+          await new Promise((r) => setTimeout(r, 120));
+        }
+      }
+    } catch (fatalErr) {
+      const msg =
+        fatalErr instanceof Error
+          ? fatalErr.message
+          : 'Erro inesperado no processamento em lote.';
+      console.error('[Pipeline] Fatal batch error:', fatalErr);
+      setPipeline((prev) => ({
+        ...prev,
+        lastNote: msg,
+      }));
+    } finally {
+      pipelineRunningRef.current = false;
+      pipelineAbortRef.current = null;
+      const wasCancelled = cancelFlagRef.current;
+      setPipeline((prev) => ({
+        ...prev,
+        running: false,
+        paused: false,
+        currentStage: 'done',
+        lastNote: wasCancelled
+          ? `Processamento cancelado pelo usuário (${processed}/${pendingItems.length} concluídos).`
+          : prev.lastNote,
+      }));
       await refreshItems();
     }
-
-    setPipeline((prev) => ({
-      ...prev,
-      running: false,
-      paused: false,
-      currentStage: 'done',
-    }));
   };
 
   const handleTogglePause = () => {
@@ -782,13 +888,22 @@ export function AdminPanel({
   const handleCancelPipeline = () => {
     cancelFlagRef.current = true;
     pauseFlagRef.current = false;
+    pipelineAbortRef.current?.abort();
   };
 
   const handleProcessSingle = async (item: CatalogItem) => {
     setBusyItemId(item.id);
     try {
-      await processItemFullPipeline(item, settings);
+      const updated = await processItemFullPipeline(item, settings);
+      setItems((prev) => prev.map((it) => (it.id === updated.id ? updated : it)));
       await refreshItems();
+    } catch (err) {
+      const msg =
+        err instanceof Error ? err.message : 'Erro ao validar item.';
+      setPipeline((prev) => ({
+        ...prev,
+        lastNote: `Falha ao validar "${item.title}": ${msg}`,
+      }));
     } finally {
       setBusyItemId(null);
     }
@@ -1605,7 +1720,7 @@ export function AdminPanel({
               </div>
             )}
 
-            {(pipeline.running || pipeline.processed > 0) && (
+            {(pipeline.running || pipeline.processed > 0 || pipeline.lastNote) && (
               <div className="space-y-2 border-t border-white/10 pt-4">
                 <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
                   <span className="font-medium text-white">
@@ -1619,7 +1734,7 @@ export function AdminPanel({
                                 ? 'Etapa B · TMDB pt-BR'
                                 : 'Etapa C · Trailer YouTube'
                           }): ${pipeline.currentTitle}`
-                      : `Lote finalizado · ${pipeline.approved} aprovados · ${pipeline.offline} offline`}
+                      : `Lote finalizado · ${pipeline.approved} aprovados · ${pipeline.pendingCors || 0} pendentes (CORS/Proxy) · ${pipeline.offline} offline${pipeline.failed ? ` · ${pipeline.failed} falhas` : ''}`}
                   </span>
                   <span className="text-white/65 tabular-nums">
                     {pipeline.processed} / {pipeline.total}

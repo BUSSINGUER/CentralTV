@@ -17,10 +17,110 @@ export interface PipelineProgress {
   processed: number;
   total: number;
   approved: number;
+  pendingCors?: number;
   offline: number;
+  failed?: number;
   currentTitle: string;
   currentStage: PipelineStage;
   lastNote?: string;
+}
+
+function createAbortError(): Error {
+  const err = new Error('Operação cancelada pelo usuário.');
+  err.name = 'AbortError';
+  return err;
+}
+
+function throwIfAborted(signal?: AbortSignal) {
+  if (signal?.aborted) {
+    throw createAbortError();
+  }
+}
+
+async function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return;
+  throwIfAborted(signal);
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(createAbortError());
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const concurrency = Math.max(1, Math.min(limit, items.length));
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+
+  const runWorker = async () => {
+    while (cursor < items.length) {
+      const idx = cursor++;
+      results[idx] = await worker(items[idx], idx);
+    }
+  };
+
+  await Promise.all(Array.from({ length: concurrency }, () => runWorker()));
+  return results;
+}
+
+async function fetchJsonWithRetry<T>(
+  url: string,
+  init: RequestInit,
+  options?: { maxAttempts?: number; signal?: AbortSignal }
+): Promise<{ ok: boolean; status: number; data: T | null; rawError?: string }> {
+  const maxAttempts = options?.maxAttempts ?? 2;
+  const signal = options?.signal;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    throwIfAborted(signal);
+    const resp = await fetch(url, { ...init, signal });
+    const text = await resp.text();
+    let parsed: T | null = null;
+    if (text) {
+      try {
+        parsed = JSON.parse(text) as T;
+      } catch {
+        parsed = null;
+      }
+    }
+
+    const shouldRetry =
+      attempt < maxAttempts &&
+      (resp.status === 429 ||
+        resp.status === 502 ||
+        resp.status === 503 ||
+        resp.status === 504);
+
+    if (shouldRetry) {
+      const retryAfterHeader = Number(resp.headers.get('retry-after') || '0');
+      const delayMs =
+        retryAfterHeader > 0
+          ? Math.min(retryAfterHeader * 1000, 3000)
+          : 700 * attempt;
+      await abortableSleep(delayMs, signal);
+      continue;
+    }
+
+    return {
+      ok: resp.ok,
+      status: resp.status,
+      data: parsed,
+      rawError: !resp.ok && !parsed ? text.slice(0, 200) : undefined,
+    };
+  }
+
+  return { ok: false, status: 0, data: null };
 }
 
 async function probeBrowserVideoMetadata(
@@ -107,14 +207,17 @@ async function probeBrowserVideoMetadata(
 
 export async function probeSingleSource(
   source: MediaSource,
-  timeoutMs: number
+  timeoutMs: number,
+  signal?: AbortSignal
 ): Promise<MediaSource> {
+  throwIfAborted(signal);
   const checkedAt = Date.now();
   const started = performance.now();
 
   try {
     const resp = await fetch(
-      `/api/check-stream?url=${encodeURIComponent(source.url)}&timeoutMs=${timeoutMs}`
+      `/api/check-stream?url=${encodeURIComponent(source.url)}&timeoutMs=${timeoutMs}`,
+      { signal }
     );
 
     if (resp.ok) {
@@ -173,10 +276,14 @@ export async function probeSingleSource(
         lastCheckedAt: checkedAt,
       };
     }
-  } catch {
+  } catch (err) {
+    if ((err as Error)?.name === 'AbortError') {
+      throw err;
+    }
     // Fall through to browser metadata check only if backend endpoint is unreachable
   }
 
+  throwIfAborted(signal);
   const browserRes = await probeBrowserVideoMetadata(source.url, timeoutMs);
   return {
     ...source,
@@ -199,9 +306,28 @@ export async function probeSingleSource(
 
 export async function runHealthCheckForItem(
   item: CatalogItem,
-  timeoutMs: number
+  timeoutMs: number,
+  signal?: AbortSignal
 ): Promise<CatalogItem> {
+  throwIfAborted(signal);
   const sources = item.sources ?? [];
+
+  // Series store stream links inside episodes[]; enrich TMDB/YouTube directly without probing all episodes.
+  if (item.type === 'series' && sources.length === 0) {
+    const hasEpisodeSources = (item.episodes ?? []).some(
+      (ep) => (ep.sources?.length ?? 0) > 0
+    );
+    if (hasEpisodeSources) {
+      return {
+        ...item,
+        healthChecked: true,
+        status: item.status === 'publicado' ? 'publicado' : 'aprovado',
+        lastError: undefined,
+        updatedAt: Date.now(),
+      };
+    }
+  }
+
   if (sources.length === 0) {
     return {
       ...item,
@@ -212,8 +338,8 @@ export async function runHealthCheckForItem(
     };
   }
 
-  const checkedSources = await Promise.all(
-    sources.map((src) => probeSingleSource(src, timeoutMs))
+  const checkedSources = await mapWithConcurrency(sources, 3, (src) =>
+    probeSingleSource(src, timeoutMs, signal)
   );
   const hasOnline = checkedSources.some((s) => s.status === 'online');
   const hasBlockedNotOffline = checkedSources.some(
@@ -227,7 +353,14 @@ export async function runHealthCheckForItem(
     ...item,
     sources: checkedSources,
     healthChecked: true,
-    status: hasOnline ? 'aprovado' : hasBlockedNotOffline ? 'pendente' : 'offline',
+    status:
+      item.status === 'publicado'
+        ? 'publicado'
+        : hasOnline
+          ? 'aprovado'
+          : hasBlockedNotOffline
+            ? 'pendente'
+            : 'offline',
     lastError: hasOnline
       ? undefined
       : hasBlockedNotOffline
@@ -239,7 +372,8 @@ export async function runHealthCheckForItem(
 
 export async function runTmdbEnrichmentForItem(
   item: CatalogItem,
-  tmdbApiKey: string
+  tmdbApiKey: string,
+  signal?: AbortSignal
 ): Promise<{ item: CatalogItem; note?: string }> {
   if (item.type === 'live' || item.type === 'radio') {
     return {
@@ -247,19 +381,12 @@ export async function runTmdbEnrichmentForItem(
     };
   }
 
-  try {
-    const resp = await fetch('/api/tmdb/enrich', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        title: item.title,
-        year: item.year,
-        type: item.type,
-        tmdbApiKey,
-      }),
-    });
+  if (item.tmdbEnriched && item.tmdbId) {
+    return { item };
+  }
 
-    const data = (await resp.json()) as {
+  try {
+    const res = await fetchJsonWithRetry<{
       found?: boolean;
       missingKey?: boolean;
       error?: string;
@@ -277,7 +404,22 @@ export async function runTmdbEnrichmentForItem(
       backdropImage?: string;
       platform?: PlatformId | null;
       youtubeTrailerId?: string;
-    };
+    }>(
+      '/api/tmdb/enrich',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: item.title,
+          year: item.year,
+          type: item.type,
+          tmdbApiKey,
+        }),
+      },
+      { maxAttempts: 2, signal }
+    );
+
+    const data = res.data || {};
 
     if (data.missingKey) {
       return {
@@ -286,10 +428,15 @@ export async function runTmdbEnrichmentForItem(
       };
     }
 
-    if (!resp.ok || !data.found) {
+    if (!res.ok || !data.found) {
       return {
         item: { ...item, tmdbEnriched: false, updatedAt: Date.now() },
-        note: data.error || 'Título não encontrado no TMDB.',
+        note:
+          data.error ||
+          res.rawError ||
+          (res.status === 429
+            ? 'Limite de requisições TMDB atingido (HTTP 429).'
+            : 'Título não encontrado no TMDB.'),
       };
     }
 
@@ -316,6 +463,7 @@ export async function runTmdbEnrichmentForItem(
       },
     };
   } catch (err) {
+    if ((err as Error)?.name === 'AbortError') throw err;
     return {
       item,
       note: err instanceof Error ? err.message : 'Erro ao consultar TMDB.',
@@ -325,7 +473,8 @@ export async function runTmdbEnrichmentForItem(
 
 export async function runYoutubeSearchForItem(
   item: CatalogItem,
-  youtubeApiKey: string
+  youtubeApiKey: string,
+  signal?: AbortSignal
 ): Promise<CatalogItem> {
   if (item.type === 'live' || item.type === 'radio') {
     return { ...item, youtubeEnriched: true, updatedAt: Date.now() };
@@ -337,24 +486,23 @@ export async function runYoutubeSearchForItem(
 
   const query = `${item.title} ${item.year || ''} trailer oficial dublado`.trim();
   try {
-    const resp = await fetch(
+    const res = await fetchJsonWithRetry<{ videoId?: string | null }>(
       `/api/youtube/search?q=${encodeURIComponent(query)}`,
       {
         headers: youtubeApiKey ? { 'x-youtube-key': youtubeApiKey } : {},
-      }
+      },
+      { maxAttempts: 2, signal }
     );
-    if (resp.ok) {
-      const data = (await resp.json()) as { videoId?: string | null };
-      if (data.videoId) {
-        return {
-          ...item,
-          youtubeTrailerId: data.videoId,
-          youtubeEnriched: true,
-          updatedAt: Date.now(),
-        };
-      }
+    if (res.ok && res.data?.videoId) {
+      return {
+        ...item,
+        youtubeTrailerId: res.data.videoId,
+        youtubeEnriched: true,
+        updatedAt: Date.now(),
+      };
     }
-  } catch {
+  } catch (err) {
+    if ((err as Error)?.name === 'AbortError') throw err;
     // Keep empty trailer ID cleanly
   }
 
@@ -393,25 +541,46 @@ export async function fetchAndCacheTrailerOnDemand(
 export async function processItemFullPipeline(
   item: CatalogItem,
   settings: AppSettings,
-  onStage?: (stage: PipelineStage, note?: string) => void
+  onStage?: (stage: PipelineStage, note?: string) => void,
+  options?: {
+    signal?: AbortSignal;
+    skipServerSync?: boolean;
+  }
 ): Promise<CatalogItem> {
-  onStage?.('health');
-  let updated = await runHealthCheckForItem(item, settings.probeTimeoutMs);
+  const signal = options?.signal;
+  throwIfAborted(signal);
 
-  if (updated.status === 'aprovado') {
+  onStage?.('health');
+  let updated = await runHealthCheckForItem(
+    item,
+    settings.probeTimeoutMs,
+    signal
+  );
+
+  // Enrich both approved items (including series) and pendente items (e.g. CORS/Proxy/HTML blocked)
+  if (updated.status !== 'offline') {
+    throwIfAborted(signal);
     onStage?.('tmdb');
     const tmdbRes = await runTmdbEnrichmentForItem(
       updated,
-      settings.tmdbApiKey
+      settings.tmdbApiKey,
+      signal
     );
     updated = tmdbRes.item;
 
+    throwIfAborted(signal);
     onStage?.('youtube', tmdbRes.note);
-    updated = await runYoutubeSearchForItem(updated, settings.youtubeApiKey);
+    updated = await runYoutubeSearchForItem(
+      updated,
+      settings.youtubeApiKey,
+      signal
+    );
   }
 
   await db.mediaItems.put(updated);
-  void syncCatalogItemsToServer([updated]);
-  onStage?.('done');
+  if (!options?.skipServerSync) {
+    await syncCatalogItemsToServer([updated]);
+  }
+  onStage?.('done', updated.lastError);
   return updated;
 }

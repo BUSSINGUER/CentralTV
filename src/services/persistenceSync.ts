@@ -320,10 +320,10 @@ export async function syncCatalogItemsToServer(
   items: CatalogItem[],
   list?: M3uListRecord,
   mergeWithoutOverwrite = false
-): Promise<void> {
-  if (items.length === 0 && !list) return;
+): Promise<{ synced: boolean; error?: string }> {
+  if (items.length === 0 && !list) return { synced: true };
   const headers = await getBearerHeaders();
-  if (!headers) return;
+  if (!headers) return { synced: false };
 
   try {
     const chunkSize = 250;
@@ -338,15 +338,25 @@ export async function syncCatalogItemsToServer(
           mergeWithoutOverwrite,
         }),
       });
-      if (resp.ok) {
-        const data = (await resp.json()) as { idMap?: Record<string, string> };
-        if (data.idMap) {
-          await remapLocalIdsIfNeeded(data.idMap);
-        }
+      if (!resp.ok) {
+        const errBody = await resp.json().catch(() => ({})) as { error?: string };
+        return {
+          synced: false,
+          error: errBody.error || `Falha na sincronização (HTTP ${resp.status}).`,
+        };
+      }
+      const data = (await resp.json()) as { idMap?: Record<string, string> };
+      if (data.idMap) {
+        await remapLocalIdsIfNeeded(data.idMap);
       }
     }
-  } catch {
+    return { synced: true };
+  } catch (err) {
     // Keep IndexedDB operational when offline
+    return {
+      synced: false,
+      error: err instanceof Error ? err.message : 'Erro de rede na sincronização.',
+    };
   }
 }
 
