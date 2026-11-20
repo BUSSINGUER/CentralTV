@@ -413,6 +413,7 @@ export async function runTmdbEnrichmentForItem(
           title: item.title,
           year: item.year,
           type: item.type,
+          tmdbId: item.tmdbId,
           tmdbApiKey,
         }),
       },

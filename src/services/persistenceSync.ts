@@ -18,7 +18,8 @@ let catalogCacheEpoch = 0;
 let localImportsInProgress = 0;
 const activeListUploads = new Set<string>();
 const CATALOG_BATCH_SIZE = 250;
-const MAX_SOURCES_PER_REQUEST = 500;
+const IMPORT_BATCH_SIZE = 50;
+const IMPORT_SOURCES_PER_REQUEST = 200;
 const UPLOAD_REQUEST_TIMEOUT_MS = 75_000;
 
 export interface CatalogUploadProgress {
@@ -424,12 +425,12 @@ export async function resumeCatalogListUpload(
       let sourceOffset = pending.sourceOffset || 0;
       let sourceCount = 0;
       const items: CatalogItem[] = [];
-      const rows = await db.mediaItems.bulkGet(pending.itemIds.slice(cursor, cursor + CATALOG_BATCH_SIZE));
+      const rows = await db.mediaItems.bulkGet(pending.itemIds.slice(cursor, cursor + IMPORT_BATCH_SIZE));
       for (const row of rows) {
         if (!row) {
           throw new Error('Há títulos ausentes na cópia local. Preserve o arquivo M3U para recuperar esta lista.');
         }
-        const piece = sliceWorkForUpload(row, list.id, sourceOffset, MAX_SOURCES_PER_REQUEST - sourceCount);
+        const piece = sliceWorkForUpload(row, list.id, sourceOffset, IMPORT_SOURCES_PER_REQUEST - sourceCount);
         items.push(piece.item);
         sourceCount += piece.sourceCount;
         if (piece.remaining) {
@@ -438,7 +439,7 @@ export async function resumeCatalogListUpload(
         }
         cursor++;
         sourceOffset = 0;
-        if (sourceCount >= MAX_SOURCES_PER_REQUEST) break;
+        if (sourceCount >= IMPORT_SOURCES_PER_REQUEST) break;
       }
       const deadline = AbortSignal.timeout(UPLOAD_REQUEST_TIMEOUT_MS);
       const requestSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;

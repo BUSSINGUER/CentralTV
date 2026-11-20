@@ -56,6 +56,7 @@ export function detectMediaTypeFromUrl(
   if (cleanPath.endsWith('.mov')) return 'mov';
   if (cleanPath.endsWith('.mpd') || lower.includes('.mpd?')) return 'dash';
   if (cleanPath.endsWith('.m3u8') || lower.includes('.m3u8?')) return 'hls';
+  if (isLive && cleanPath.endsWith('.txt')) return 'hls';
   if (cleanPath.endsWith('.ts') || lower.includes('output=ts')) return 'mpegts';
   if (
     cleanPath.endsWith('.mp3') ||

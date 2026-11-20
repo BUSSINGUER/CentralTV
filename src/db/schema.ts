@@ -4,6 +4,7 @@ import {
   boolean,
   index,
   integer,
+  jsonb,
   pgTable,
   real,
   serial,
@@ -11,6 +12,7 @@ import {
   timestamp,
   uniqueIndex,
 } from 'drizzle-orm/pg-core';
+import type { MediaSource } from '../types/streaming.ts';
 
 export const users = pgTable('users', {
   id: serial('id').primaryKey(),
@@ -184,6 +186,7 @@ export const sources = pgTable(
     originalName: text('original_name'),
     url: text('url').notNull(),
     resolvedUrl: text('resolved_url'),
+    playbackOptions: jsonb('playback_options').$type<Pick<MediaSource, 'headers' | 'clearKey'>>(),
     detectedFormat: text('detected_format'),
     groupTitle: text('group_title'),
     tvgId: text('tvg_id'),

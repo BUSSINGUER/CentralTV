@@ -38,6 +38,7 @@ export interface M3UImportStats {
   ignoredDuplicates: number;
   byKind: Record<MediaKind, number>;
   touchedItemIds?: string[];
+  awaitingUpload?: boolean;
   syncError?: string;
 }
 
@@ -477,6 +478,8 @@ export async function importM3UFromStream(
   const discoveredOrigins = new Set<string>();
   let carryOver = '';
   let currentExtInf: ParsedExtInf | null = null;
+  let channel: ParsedExtInf | null = null;
+  let channelSource: (Pick<MediaSource, 'url' | 'headers' | 'clearKey' | 'qualityTag'> & { invalidKey?: boolean }) | null = null;
 
   const flushBatch = async () => {
     if (dirtyItems.size === 0) return;
@@ -496,7 +499,7 @@ export async function importM3UFromStream(
     await db.mediaItems.bulkPut(batch);
   };
 
-  const processLine = (rawLine: string) => {
+  const processLine = (rawLine: string, liveOptions?: NonNullable<typeof channelSource>) => {
     const line = rawLine.trim();
     stats.linesParsed += 1;
     if (!line || line.startsWith('#EXTM3U')) return;
@@ -530,7 +533,7 @@ export async function importM3UFromStream(
     currentExtInf = null;
 
     const rawTitle = meta.tvgName || meta.displayName || 'Sem Título';
-    const mediaKind = classifyEntry(line, rawTitle, meta.groupTitle);
+    const mediaKind = liveOptions ? 'live' : classifyEntry(line, rawTitle, meta.groupTitle);
 
     let groupItemTitle = rawTitle;
     let year: number | undefined;
@@ -542,8 +545,8 @@ export async function importM3UFromStream(
     if (mediaKind === 'live') {
       const liveNorm = normalizeLiveChannelName(meta.displayName || rawTitle);
       groupItemTitle = liveNorm.cleanChannelName;
-      qualityTag = liveNorm.qualityTag;
-      resolutionTag = liveNorm.qualityTag;
+      qualityTag = liveOptions?.qualityTag || liveNorm.qualityTag;
+      resolutionTag = qualityTag;
     } else if (mediaKind === 'series') {
       episodeInfo = extractEpisodeInfo(rawTitle);
       const cleaned = cleanTitleAndExtractYear(
@@ -671,9 +674,26 @@ export async function importM3UFromStream(
     }
 
     const existingSources = item.sources ?? [];
-    const alreadyHasUrl = existingSources.some((s) => s.url === line && s.listId === listId);
+    const matchedSource = existingSources.find((s) => s.url === line && s.listId === listId);
+    const alreadyHasUrl = Boolean(matchedSource);
 
-    if (alreadyHasUrl) {
+    if (matchedSource) {
+      if (liveOptions) {
+        const headers = liveOptions.headers
+          ? { ...matchedSource.headers, ...liveOptions.headers }
+          : matchedSource.headers;
+        const clearKey = liveOptions.clearKey ?? matchedSource.clearKey;
+        if (matchedSource.headers?.referer !== headers?.referer ||
+          matchedSource.headers?.userAgent !== headers?.userAgent ||
+          matchedSource.clearKey?.keyId !== clearKey?.keyId ||
+          matchedSource.clearKey?.key !== clearKey?.key ||
+          matchedSource.qualityTag !== qualityTag) {
+          item.sources = sortAndRelabelSources(existingSources.map((source) => source === matchedSource
+            ? { ...source, headers, clearKey, qualityTag, resolutionTag }
+            : source));
+          itemModified = true;
+        }
+      }
       // Caso 1: Título já existe e URL exata já cadastrada -> ignora duplicata sem rebaixar status
       if (!isBrandNewItem && !(mediaKind === 'series' && episodeInfo)) {
         stats.ignoredDuplicates += 1;
@@ -689,6 +709,8 @@ export async function importM3UFromStream(
         languageTag,
         originalName: rawTitle,
         url: line,
+        headers: liveOptions?.headers,
+        clearKey: liveOptions?.clearKey,
         listId,
         groupTitle: meta.groupTitle,
         tvgId: meta.tvgId || undefined,
@@ -784,6 +806,57 @@ export async function importM3UFromStream(
     }
   };
 
+  const flushChannelSource = () => {
+    if (channel && channelSource && !channelSource.invalidKey) {
+      currentExtInf = channel;
+      processLine(channelSource.url, channelSource);
+    }
+    channelSource = null;
+  };
+  const processPlaylistLine = (raw: string) => {
+    const line = raw.trim();
+    const field = /^([\p{L}]+)\s*:\s*(.*)$/u.exec(line);
+    if (field?.[1].toLowerCase() === 'canal') {
+      flushChannelSource();
+      const name = field[2];
+      channel = { tvgId: '', tvgName: name, tvgLogo: '', groupTitle: '', displayName: name };
+      return;
+    }
+    if (!channel) {
+      processLine(raw);
+      return;
+    }
+    if (!field) return;
+    const [, label, value] = field;
+    switch (label.toLowerCase()) {
+      case 'fonte':
+        flushChannelSource();
+        channelSource = { url: value };
+        break;
+      case 'logo':
+        channel.tvgLogo = sanitizeLogoUrl(value);
+        break;
+      case 'categoria':
+        channel.groupTitle = value;
+        break;
+      case 'qualidade':
+        if (channelSource) channelSource.qualityTag = value;
+        break;
+      case 'referer':
+        if (channelSource) channelSource.headers = { ...channelSource.headers, referer: value };
+        break;
+      case 'agente':
+        if (channelSource) channelSource.headers = { ...channelSource.headers, userAgent: value };
+        break;
+      case 'chave': {
+        if (!channelSource) break;
+        const pair = /^([a-f\d]{32}):([a-f\d]{32})$/i.exec(value);
+        channelSource.invalidKey = !pair;
+        channelSource.clearKey = pair ? { keyId: pair[1], key: pair[2] } : undefined;
+        break;
+      }
+    }
+  };
   while (true) {
     if (options.signal?.aborted) {
       throw new DOMException('Importação cancelada', 'AbortError');
@@ -798,23 +871,19 @@ export async function importM3UFromStream(
     carryOver = lines.pop() ?? '';
 
     for (let i = 0; i < lines.length; i++) {
-      processLine(lines[i]);
+      processPlaylistLine(lines[i]);
+      if (dirtyItems.size >= 400) await flushBatch();
       if (i > 0 && i % 2000 === 0) {
         await new Promise((r) => setTimeout(r, 0));
       }
-    }
-
-    if (dirtyItems.size >= 400) {
-      await flushBatch();
     }
 
     options.onProgress?.({ ...stats, byKind: { ...stats.byKind } });
   }
 
   const tail = carryOver + decoder.decode();
-  if (tail.trim()) {
-    processLine(tail);
-  }
+  if (tail.trim()) processPlaylistLine(tail);
+  flushChannelSource();
 
   await flushBatch();
   stats.touchedItemIds = Array.from(touchedIdSet);
@@ -1168,6 +1237,10 @@ async function persistListSummary(
     await saveM3uListRecord(record);
     await db.pendingCatalogImports.put({ id: record.id, itemIds: stats.touchedItemIds || [], cursor: 0 });
   });
+  if (stats.rawEntries > 1000) {
+    stats.awaitingUpload = true;
+    return;
+  }
   try {
     await resumeCatalogListUpload(record, options?.signal, options?.onUploadProgress);
   } catch (error) {
@@ -1836,7 +1909,22 @@ async function importM3UUrl(
 ): Promise<M3UImportStats> {
   const cleanUrl = url.trim();
   const listId = options.listId || `list-${crypto.randomUUID().slice(0, 10)}`;
-  const resp = await fetch(
+  const directDeadline = new AbortController();
+  const directTimer = setTimeout(() => directDeadline.abort(), 8000);
+  const direct = /^https:\/\//i.test(cleanUrl)
+    ? await fetch(cleanUrl, {
+        credentials: 'omit',
+        signal: options.signal
+          ? AbortSignal.any([options.signal, directDeadline.signal])
+          : directDeadline.signal,
+      }).catch(() => undefined)
+    : undefined;
+  clearTimeout(directTimer);
+  const useDirect = direct?.ok && direct.body &&
+    !direct.headers.get('content-type')?.toLowerCase().includes('text/html');
+  if (!useDirect) await direct?.body?.cancel().catch(() => {});
+  options.signal?.throwIfAborted();
+  const resp = useDirect ? direct : await fetch(
     `/api/fetch-list?url=${encodeURIComponent(cleanUrl)}`,
     { signal: options.signal }
   );
@@ -1861,6 +1949,7 @@ async function importM3UUrl(
 
   // Peek the initial bytes to confirm HTML vs JSON vs M3U safely
   const peekedChunks: Uint8Array[] = [];
+  const sampleDecoder = new TextDecoder();
   let peekedBytes = 0;
   let sampleText = '';
 
@@ -1870,8 +1959,8 @@ async function importM3UUrl(
     if (value && value.byteLength > 0) {
       peekedChunks.push(value);
       peekedBytes += value.byteLength;
-      sampleText += new TextDecoder().decode(value, { stream: true });
-      if (sampleText.trimStart().length >= 32) break;
+      sampleText += sampleDecoder.decode(value, { stream: true });
+      if (/^\s*canal\s*:/im.test(sampleText) || sampleText.includes('#EXTM3U')) break;
     }
   }
 
@@ -1946,13 +2035,14 @@ async function importM3UUrl(
   const looksLikeM3u =
     trimmedSample.includes('#EXTM3U') ||
     trimmedSample.includes('#EXTINF') ||
+    /^\s*canal\s*:/im.test(trimmedSample) ||
     headerFormat === 'm3u' ||
     /^https?:\/\//i.test(trimmedSample);
 
   if (!looksLikeM3u) {
     await reader.cancel().catch(() => {});
     throw new Error(
-      'O conteúdo retornado não é uma lista M3U (#EXTM3U / #EXTINF) nem um catálogo JSON válido.'
+      'O conteúdo não é uma lista M3U, um catálogo TXT de canais ou um catálogo JSON válido.'
     );
   }
 

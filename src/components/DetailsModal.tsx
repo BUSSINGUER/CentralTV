@@ -50,9 +50,7 @@ export function DetailsModal({
   const [resolvedTrailerId, setResolvedTrailerId] = useState(
     item?.youtubeTrailerId || ''
   );
-  const [showTrailer, setShowTrailer] = useState(
-    Boolean(item?.youtubeTrailerId)
-  );
+  const [showTrailer, setShowTrailer] = useState(false);
 
   const episodes: SeriesEpisode[] = item?.episodes || [];
   const seasons = useMemo(() => {
@@ -241,7 +239,6 @@ export function DetailsModal({
   useEffect(() => {
     const initialId = item?.youtubeTrailerId || '';
     setResolvedTrailerId(initialId);
-    setShowTrailer(Boolean(initialId));
 
     if (
       !item ||
@@ -257,7 +254,6 @@ export function DetailsModal({
       if (!cancelled) {
         if (enriched.youtubeTrailerId) {
           setResolvedTrailerId(enriched.youtubeTrailerId);
-          setShowTrailer(true);
         }
         onItemEnriched?.(enriched);
       }
@@ -461,6 +457,7 @@ export function DetailsModal({
                 <button
                   type="button"
                   onClick={() => setShowTrailer((prev) => !prev)}
+                  aria-pressed={showTrailer}
                   className="inline-flex h-11 items-center gap-2 rounded-lg border border-white/20 bg-black/50 px-5 text-sm font-semibold text-white/90 backdrop-blur-md transition-colors hover:bg-white/15"
                 >
                   <Film className="h-4 w-4" />

@@ -1,4 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type Hls from 'hls.js';
+import { HlsTrackControls } from './player/HlsTrackControls';
+import { ExternalSubtitleControl } from './player/ExternalSubtitleControl';
 import {
   Activity,
   AlertTriangle,
@@ -211,6 +214,8 @@ export function VideoPlayer({
   const [isMuted, setIsMuted] = useState(false);
   const [showSourcesMenu, setShowSourcesMenu] = useState(false);
   const [showLatencyMenu, setShowLatencyMenu] = useState(false);
+  const [hls, setHls] = useState<Hls | null>(null);
+  const [mediaElement, setMediaElement] = useState<HTMLVideoElement | null>(null);
   const [liveLatencyProfile, setLiveLatencyProfile] =
     useState<LiveLatencyProfile>(() => getSavedLiveLatencyProfile());
   const [activeEngine, setActiveEngine] = useState<HybridEngineKind>('none');
@@ -234,16 +239,18 @@ export function VideoPlayer({
 
   const handleVideoElement = useCallback((node: HTMLVideoElement | null) => {
     videoRef.current = node;
+    setMediaElement(node);
   }, []);
 
   const activeSource = availableSources[sourceIndex];
   const rawStreamUrl = activeSource?.url || '';
   const isLive = item?.type === 'live';
-  const isLiveHlsActive = Boolean(
+  const hasLiveLatencyControls = Boolean(
     isLive &&
       rawStreamUrl &&
       (activeEngine === 'hls.js' ||
-        activeEngine === 'native-hls' ||
+        activeEngine === 'mpegts.js' ||
+        activeEngine === 'shaka' ||
         (activeEngine === 'none' &&
           detectMediaTypeFromUrl(rawStreamUrl, true) === 'hls'))
   );
@@ -584,6 +591,8 @@ export function VideoPlayer({
             forceProxy={forceInternalProxy}
             enablePreflight={true}
             sourceHeaders={activeSource?.headers}
+            onHlsInstance={setHls}
+            clearKey={activeSource?.clearKey}
             liveLatencyProfile={liveLatencyProfile}
             onLiveLatencyProfileChange={handleLatencyProfileChange}
             onEngineChange={setActiveEngine}
@@ -943,7 +952,11 @@ export function VideoPlayer({
           </div>
 
           <div className="relative flex items-center gap-2">
-            {isLiveHlsActive && (
+            {hls && <HlsTrackControls hls={hls} />}
+            {!isLive && item?.type !== 'radio' && mediaElement && (
+              <ExternalSubtitleControl key={episodeId ?? item.id} video={mediaElement} />
+            )}
+            {hasLiveLatencyControls && (
               <div className="relative">
                 <button
                   type="button"
@@ -952,7 +965,8 @@ export function VideoPlayer({
                     setShowSourcesMenu(false);
                   }}
                   aria-label="Latência da transmissão"
-                  title="Latência da transmissão (ao vivo HLS)"
+                  title="Latência da transmissão ao vivo"
+                  aria-expanded={showLatencyMenu}
                   className="inline-flex h-10 items-center gap-2 rounded-lg border border-white/15 bg-black/60 px-3 text-xs font-semibold text-white hover:bg-white/15"
                 >
                   <Gauge className="h-4 w-4 text-[#E50914]" />

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import test, { after, before } from 'node:test';
 import Hls from 'hls.js';
+import { directFragmentUrl } from '../src/components/player/directHlsFragments';
 import {
   createServer,
   rewriteHlsManifest,
@@ -31,6 +32,34 @@ import {
 
 let server: http.Server;
 let baseUrl = '';
+
+test('Only eligible HTTPS fragments can leave the same-origin media proxy', () => {
+  const page = 'https://tv.example/';
+  const request = (url: string) => '/api/stream?url=' + encodeURIComponent(url);
+  assert.equal(directFragmentUrl(request('https://media.example/demo.ts'), page)?.pathname, '/demo.ts');
+  assert.equal(directFragmentUrl(request('http://media.example/demo.ts'), page), undefined);
+  assert.equal(directFragmentUrl(request('https://media.example/demo.ts') + '&ua=custom', page), undefined);
+  assert.equal(directFragmentUrl('https://other.example' + request('https://media.example/demo.ts'), page), undefined);
+});
+
+test('List proxy forwards a decoded upstream body without its compressed length', async () => {
+  const upstream = 'https://example.com/catalogo.txt';
+  const body = 'canal: Teste\nfonte: https://example.com/stream.m3u8\n';
+  const realFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = (input, init) => String(input) === upstream
+      ? Promise.resolve(new Response(body, {
+          headers: { 'content-type': 'text/plain', 'content-length': '16', 'content-encoding': 'gzip' },
+        }))
+      : realFetch(input, init);
+    const response = await realFetch(baseUrl + '/api/fetch-list?url=' + encodeURIComponent(upstream));
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('content-length'), null);
+    assert.equal(await response.text(), body);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
 
 before(async () => {
   const app = await createServer();

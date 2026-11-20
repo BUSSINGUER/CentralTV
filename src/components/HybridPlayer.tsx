@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Hls from 'hls.js';
+import { makeDirectFragmentLoader } from './player/directHlsFragments';
 import mpegts from 'mpegts.js';
 import { AlertTriangle, Gauge, Loader2, Play } from 'lucide-react';
 import { redactUrlCredentials } from '../services/streamOrigins';
@@ -93,6 +94,8 @@ export interface HybridPlayerProps {
   forceProxy?: boolean;
   enablePreflight?: boolean;
   sourceHeaders?: AuthorizedStreamHeaders;
+  onHlsInstance?: (hls: Hls | null) => void;
+  clearKey?: import('../types/streaming').ClearKeyConfig;
   liveLatencyProfile?: LiveLatencyProfile;
   onLiveLatencyProfileChange?: (profile: LiveLatencyProfile) => void;
   onVideoElement?: (video: HTMLVideoElement | null) => void;
@@ -110,6 +113,11 @@ export interface HybridPlayerProps {
 }
 
 interface ShakaPlayerInstance {
+  configure: (config: unknown) => void;
+  getNetworkingEngine: () => {
+    registerRequestFilter: (filter: (type: number, request: { uris: string[] }) => void) => void;
+    registerResponseFilter: (filter: (type: number, response: { uri: string; originalUri: string }) => void) => void;
+  } | null;
   attach: (mediaElement: HTMLMediaElement) => Promise<void>;
   load: (assetUri: string) => Promise<void>;
   addEventListener: (
@@ -145,6 +153,8 @@ export function HybridPlayer({
   forceProxy = false,
   enablePreflight = true,
   sourceHeaders,
+  onHlsInstance,
+  clearKey,
   liveLatencyProfile,
   onLiveLatencyProfileChange,
   onVideoElement,
@@ -1088,8 +1098,8 @@ export function HybridPlayer({
       applyInitialResumeSeek();
       if (readyFired) return;
       readyFired = true;
-      // For live HLS, keep the 12s first-frame deadline active until frames actually render/advance
-      if (!(isLive && activeMediaType === 'hls')) {
+      // For live video, keep the first-frame deadline active past metadata readiness.
+      if (!isLive || activeMediaType === 'audio') {
         clearInitialTimeoutTimers();
       }
 
@@ -1179,14 +1189,14 @@ export function HybridPlayer({
 
     const armLoadTimeout = () => {
       clearInitialTimeoutTimers();
-      const isLiveHls = isLive && activeMediaType === 'hls';
-      const timeoutMs = isLiveHls
+      const watchFirstFrame = isLive && activeMediaType !== 'audio';
+      const timeoutMs = watchFirstFrame
         ? LIVE_FIRST_FRAME_TIMEOUT_MS
         : isProxyTarget
           ? 12000
           : 8000;
 
-      if (isLiveHls) {
+      if (watchFirstFrame) {
         firstFrameNudgeRef.current = window.setTimeout(() => {
           if (isStale() || firstFrameRecordedRef.current || !isPlayingRef.current) {
             return;
@@ -1205,9 +1215,9 @@ export function HybridPlayer({
       }
 
       failTimeoutRef.current = window.setTimeout(() => {
-        if (isLiveHls && firstFrameRecordedRef.current) return;
+        if (watchFirstFrame && firstFrameRecordedRef.current) return;
         void failOrAdvanceAttempt(
-          isLiveHls
+          watchFirstFrame
             ? 'Tempo limite esgotado (12s) sem exibição do primeiro frame da transmissão ao vivo.'
             : 'Tempo limite esgotado ao aguardar metadados/frames do stream.'
         );
@@ -1215,7 +1225,7 @@ export function HybridPlayer({
     };
 
     const startLiveWatchdog = () => {
-      if (!isLive || activeMediaType !== 'hls') return;
+      if (!isLive || activeMediaType === 'audio') return;
       if (liveWatchdogIntervalRef.current) {
         window.clearInterval(liveWatchdogIntervalRef.current);
       }
@@ -1237,7 +1247,11 @@ export function HybridPlayer({
           return;
         }
 
-        if (!firstFrameRecordedRef.current || !isPlayingRef.current) {
+        if (!isPlayingRef.current) {
+          lastLiveAdvancePerfRef.current = performance.now();
+          return;
+        }
+        if (!firstFrameRecordedRef.current) {
           return;
         }
 
@@ -1303,6 +1317,23 @@ export function HybridPlayer({
 
         const player = new shaka.Player() as unknown as ShakaPlayerInstance;
         shakaRef.current = player;
+        if (clearKey && activeMediaType === 'dash' &&
+          /^[a-f\d]{32}$/i.test(clearKey.keyId) && /^[a-f\d]{32}$/i.test(clearKey.key)) {
+          player.configure({ drm: { clearKeys: { [clearKey.keyId]: clearKey.key } } });
+        }
+        const profile = effectiveLatencyProfileRef.current;
+        if (isLive && activeMediaType === 'dash' && profile !== 'stable') {
+          const realtime = profile === 'realtime';
+          player.configure({ streaming: {
+            bufferingGoal: realtime ? 2 : 5,
+            rebufferingGoal: realtime ? 0.5 : 1.5,
+            liveSync: {
+              enabled: true,
+              targetLatency: realtime ? 2.5 : 5,
+              maxPlaybackRate: realtime ? 1.05 : 1.03,
+            },
+          } });
+        }
 
         player.addEventListener('error', (event) => {
           const detail = event.detail as
@@ -1327,8 +1358,40 @@ export function HybridPlayer({
           return;
         }
 
+        let manifest = dashUrl;
+        const proxyTarget = new URL(dashUrl, window.location.href);
+        const upstream = proxyTarget.origin === window.location.origin &&
+          ['/api/stream', '/api/stream/proxy'].includes(proxyTarget.pathname)
+          ? proxyTarget.searchParams.get('url')
+          : null;
+        if (activeMediaType === 'dash' && upstream && /^https?:\/\//i.test(upstream)) {
+          const engine = player.getNetworkingEngine();
+          if (engine) {
+            manifest = upstream;
+            const headers = sourceHeaders ?? {
+              referer: proxyTarget.searchParams.get('referer') ?? undefined,
+              userAgent: proxyTarget.searchParams.get('ua') ?? undefined,
+              origin: proxyTarget.searchParams.get('origin') ?? undefined,
+            };
+            const types = shaka.net.NetworkingEngine.RequestType;
+            const isDashRequest = (type: number) => type === types.MANIFEST || type === types.SEGMENT;
+            engine.registerRequestFilter((type, request) => {
+              if (!isDashRequest(type)) return;
+              request.uris = request.uris.map((uri) => /^https?:\/\//i.test(uri)
+                ? new URL(applyStreamProxyUrl(uri, '', headers), window.location.href).href
+                : uri);
+            });
+            engine.registerResponseFilter((type, response) => {
+              if (!isDashRequest(type)) return;
+              const proxy = new URL(response.originalUri, window.location.href);
+              if (proxy.origin !== window.location.origin || proxy.pathname !== '/api/stream') return;
+              const original = proxy.searchParams.get('url');
+              if (original) response.uri = original;
+            });
+          }
+        }
         wireCommonVideoDiagnosticListeners();
-        await player.load(dashUrl);
+        await player.load(manifest);
         if (!isStale()) {
           markReady();
         }
@@ -1451,7 +1514,6 @@ export function HybridPlayer({
       setEngine('hls.js');
       updateBuffering(true, `Carregando HLS.js (${currentAttempt.label})...`);
       wireCommonVideoDiagnosticListeners();
-      startLiveWatchdog();
 
       const customPrefix = streamProxyPrefix.trim();
       const requireHeaderProxy = hasAuthorizedOriginHeaders(sourceHeaders);
@@ -1638,8 +1700,14 @@ export function HybridPlayer({
             loader: LiveCapableHlsLoader,
           };
 
-      const hls = new Hls(hlsConfig);
+      const hls = new Hls({
+        ...hlsConfig,
+        ...(isProxyTarget && !forceProxy && !requireHeaderProxy && !customPrefix
+          ? { fLoader: makeDirectFragmentLoader() }
+          : {}),
+      });
       hlsRef.current = hls;
+      onHlsInstance?.(hls);
 
       let mediaRecoveryCount = 0;
       let networkRecoveryCount = 0;
@@ -1821,6 +1889,8 @@ export function HybridPlayer({
 
       try {
         setEngine('mpegts.js');
+        const profile = effectiveLatencyProfileRef.current;
+        const realtime = profile === 'realtime';
         updateBuffering(
           true,
           `Conectando transmissão MPEG-TS (${currentAttempt.label})...`
@@ -1848,6 +1918,12 @@ export function HybridPlayer({
             stashInitialSize: 128,
             lazyLoad: !isLive,
             lazyLoadMaxDuration: 3 * 60,
+            ...(isLive && profile !== 'stable' ? {
+              liveSync: true,
+              liveSyncTargetLatency: realtime ? 1.5 : 2.5,
+              liveSyncMaxLatency: realtime ? 3.5 : 5,
+              liveSyncPlaybackRate: realtime ? 1.05 : 1.03,
+            } : {}),
             ...(isLive ? {} : { seekType: 'range' }),
           }
         );
@@ -1939,6 +2015,7 @@ export function HybridPlayer({
       const activeType = activeMediaType;
       if (isStale()) return;
       armLoadTimeout();
+      startLiveWatchdog();
 
       if (activeType === 'dash') {
         await initShaka(targetUrl);
@@ -1956,6 +2033,7 @@ export function HybridPlayer({
     return () => {
       cancelled = true;
       abortController.abort();
+      onHlsInstance?.(null);
       destroyPlayers(true);
     };
   }, [
@@ -1968,13 +2046,22 @@ export function HybridPlayer({
     streamProxyPrefix,
     autoProxyHttpStreams,
     sourceHeaders,
+    onHlsInstance,
+    clearKey,
     latencyReinitTick,
     destroyPlayers,
     patchDiagnostics,
   ]);
 
   // Apply live HLS latency profile changes in-place without interrupting playback
+  const lastProfile = useRef(effectiveLatencyProfile);
   useEffect(() => {
+    const changed = lastProfile.current !== effectiveLatencyProfile;
+    lastProfile.current = effectiveLatencyProfile;
+    if (changed && isLive && (activeMediaType === 'mpegts' || activeMediaType === 'dash')) {
+      setLatencyReinitTick((t) => t + 1);
+      return;
+    }
     if (!isLive || activeMediaType !== 'hls' || !hlsRef.current) return;
     const needsReinit = applyLiveLatencyProfileToHls(
       hlsRef.current,
@@ -2024,7 +2111,7 @@ export function HybridPlayer({
         onTimeUpdate={() => {
           const video = videoRef.current;
           if (!video) return;
-          if (isLive && activeMediaType === 'hls') {
+          if (isLive && activeMediaType !== 'audio') {
             if (video.currentTime > lastLiveVideoTimeRef.current + 0.05) {
               lastLiveVideoTimeRef.current = video.currentTime;
               lastLiveAdvancePerfRef.current = performance.now();

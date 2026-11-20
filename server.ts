@@ -7,6 +7,7 @@ import http from 'http';
 import net from 'net';
 import path from 'path';
 import { Readable } from 'stream';
+import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'url';
 import zlib from 'zlib';
 import {
@@ -700,7 +701,8 @@ export async function createServer(httpServer?: http.Server) {
     }
 
     const controller = new AbortController();
-    req.on('close', () => controller.abort());
+    const onClose = () => { if (!res.writableFinished) controller.abort(); };
+    res.once('close', onClose);
     const timeoutId = setTimeout(() => controller.abort(), 45000);
 
     try {
@@ -794,7 +796,10 @@ export async function createServer(httpServer?: http.Server) {
       }
 
       const contentLength = upstream.headers.get('content-length');
-      if (contentLength) res.setHeader('Content-Length', contentLength);
+      const encoding = upstream.headers.get('content-encoding');
+      if (contentLength && (!encoding || encoding === 'identity')) {
+        res.setHeader('Content-Length', contentLength);
+      }
       res.setHeader('X-List-Format', detectedFormat);
       res.setHeader(
         'Content-Type',
@@ -803,31 +808,25 @@ export async function createServer(httpServer?: http.Server) {
           : 'text/plain; charset=utf-8'
       );
 
-      res.write(Buffer.from(firstChunk));
-
-      const restStream = new Readable({
-        async read() {
-          try {
+      const listStream = Readable.from((async function* () {
+        try {
+          yield firstChunk;
+          for (;;) {
             const { value, done } = await reader.read();
-            if (done) {
-              this.push(null);
-            } else {
-              this.push(Buffer.from(value));
-            }
-          } catch (err) {
-            this.destroy(err instanceof Error ? err : new Error('Stream read error'));
+            if (done) break;
+            if (value) yield value;
           }
-        },
-      });
-
-      req.on('close', () => {
-        restStream.destroy();
-        reader.cancel().catch(() => {});
-      });
-
-      restStream.pipe(res);
+        } finally {
+          await reader.cancel().catch(() => {});
+        }
+      })(), { objectMode: false });
+      await pipeline(listStream, res, { signal: controller.signal });
     } catch (err) {
-      if ((err as Error)?.name === 'AbortError') return;
+      if (res.destroyed) return;
+      if (controller.signal.aborted && !res.headersSent) {
+        res.status(504).json({ error: 'Tempo limite ao baixar a lista.' });
+        return;
+      }
       const message =
         err instanceof Error ? err.message : 'Erro ao acessar URL da lista.';
       if (!res.headersSent) {
@@ -835,6 +834,7 @@ export async function createServer(httpServer?: http.Server) {
       }
     } finally {
       clearTimeout(timeoutId);
+      res.off('close', onClose);
     }
   };
 
@@ -1770,6 +1770,7 @@ export async function createServer(httpServer?: http.Server) {
     title: string;
     year?: number;
     type?: string;
+    tmdbId?: number;
     tmdbApiKey?: string;
     signal?: AbortSignal;
   }): Promise<ServerTmdbEnrichResult> => {
@@ -1835,38 +1836,31 @@ export async function createServer(httpServer?: http.Server) {
     };
 
     try {
-      const searchParams = new URLSearchParams({
-        query: title,
-        language: 'pt-BR',
-        include_adult: 'false',
-      });
-      if (params.year) {
-        searchParams.set(
-          mediaKind === 'movie' ? 'year' : 'first_air_date_year',
-          String(params.year)
-        );
+      let id = Number.isSafeInteger(params.tmdbId) && (params.tmdbId ?? 0) > 0
+        ? params.tmdbId
+        : undefined;
+      if (!id) {
+        const searchParams = new URLSearchParams({
+          query: title, language: 'pt-BR', include_adult: 'false',
+        });
+        const yearParam = mediaKind === 'movie' ? 'year' : 'first_air_date_year';
+        if (params.year) searchParams.set(yearParam, String(params.year));
+        const findId = async () => {
+          const result = await tmdbFetch(`/search/${mediaKind}?${searchParams}`) as {
+            results?: Array<{ id: number }>;
+          };
+          return result.results?.[0]?.id;
+        };
+        id = await findId();
+        if (!id && params.year) {
+          searchParams.delete(yearParam);
+          id = await findId();
+        }
       }
-
-      let searchData = (await tmdbFetch(
-        `/search/${mediaKind}?${searchParams.toString()}`
-      )) as { results?: Array<{ id: number }> };
-
-      if ((!searchData.results || searchData.results.length === 0) && params.year) {
-        searchParams.delete(
-          mediaKind === 'movie' ? 'year' : 'first_air_date_year'
-        );
-        searchData = (await tmdbFetch(
-          `/search/${mediaKind}?${searchParams.toString()}`
-        )) as { results?: Array<{ id: number }> };
-      }
-
-      const firstMatch = searchData.results?.[0];
-      if (!firstMatch) {
-        return { found: false };
-      }
+      if (!id) return { found: false };
 
       const details = (await tmdbFetch(
-        `/${mediaKind}/${firstMatch.id}?language=pt-BR&append_to_response=credits,watch/providers,videos`
+        `/${mediaKind}/${id}?language=pt-BR&append_to_response=credits,watch/providers,videos`
       )) as {
         id: number;
         title?: string;
@@ -2087,6 +2081,7 @@ export async function createServer(httpServer?: http.Server) {
       title?: string;
       year?: number;
       type?: string;
+      tmdbId?: number;
       tmdbApiKey?: string;
     };
 
@@ -2100,6 +2095,7 @@ export async function createServer(httpServer?: http.Server) {
       title,
       year: body.year,
       type: body.type,
+      tmdbId: body.tmdbId,
       tmdbApiKey: body.tmdbApiKey,
     });
 

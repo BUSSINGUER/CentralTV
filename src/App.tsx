@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AdminPanel, AdminTab } from './components/AdminPanel';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { AdminTab } from './components/AdminPanel';
 import {
   ContinueWatchingRow,
   FilteredCatalogGrid,
@@ -8,7 +8,6 @@ import {
   Top10Row,
   WidescreenRow,
 } from './components/CatalogRows';
-import { DetailsModal } from './components/DetailsModal';
 import { HeroBanner } from './components/HeroBanner';
 import { Navbar } from './components/Navbar';
 import {
@@ -18,7 +17,6 @@ import {
   ProfileView,
   RadioView,
 } from './components/SecondaryViews';
-import { VideoPlayer } from './components/VideoPlayer';
 import {
   INITIAL_CATALOG,
   INITIAL_CONTINUE_WATCHING,
@@ -63,6 +61,14 @@ import {
   SeriesEpisode,
   WatchHistoryRecord,
 } from './types/streaming';
+
+const AdminPanel = lazy(() => import('./components/AdminPanel').then((m) => ({ default: m.AdminPanel })));
+const DetailsModal = lazy(() => import('./components/DetailsModal').then((m) => ({ default: m.DetailsModal })));
+const VideoPlayer = lazy(() => import('./components/VideoPlayer').then((m) => ({ default: m.VideoPlayer })));
+
+function LoadingView({ children }: { children: string }) {
+  return <p role="status" className="p-6 text-center text-sm text-white/85">{children}</p>;
+}
 
 export default function App() {
   const { user, signOutGoogle } = useAuth();
@@ -747,15 +753,17 @@ export default function App() {
       )}
 
       {activeSection === 'admin' && (
-        <AdminPanel
-          settings={settings}
-          initialTab={adminInitialTab}
-          onSettingsUpdated={setSettings}
-          onSelectItem={setModalItem}
-          onBackHome={() => handleNavigate('home')}
-          onCatalogChanged={loadPublishedCatalog}
-          onEpgChanged={loadEpg}
-        />
+        <Suspense fallback={<LoadingView>Carregando painel…</LoadingView>}>
+          <AdminPanel
+            settings={settings}
+            initialTab={adminInitialTab}
+            onSettingsUpdated={setSettings}
+            onSelectItem={setModalItem}
+            onBackHome={() => handleNavigate('home')}
+            onCatalogChanged={loadPublishedCatalog}
+            onEpgChanged={loadEpg}
+          />
+        </Suspense>
       )}
 
       <footer className="border-t border-white/8 bg-[#0B0C0E]">
@@ -804,51 +812,56 @@ export default function App() {
         </div>
       </footer>
 
-      <DetailsModal
-        item={modalItem}
-        allCatalog={allSearchableCatalog}
-        isInMyList={modalItem ? myListIds.includes(modalItem.id) : false}
-        tmdbApiKey={settings.tmdbApiKey}
-        youtubeApiKey={settings.youtubeApiKey}
-        watchHistory={watchHistory}
-        continueEntry={
-          modalItem
-            ? continueWatching.find((c) => c.itemId === modalItem.id)
-            : undefined
-        }
-        onClose={() => setModalItem(null)}
-        onPlay={handleOpenPlayer}
-        onToggleMyList={handleToggleMyList}
-        onSelectSimilar={(sim) => setModalItem(sim)}
-        onItemEnriched={handleItemEnriched}
-      />
+      {modalItem && (
+        <Suspense fallback={<LoadingView>Carregando ficha…</LoadingView>}>
+          <DetailsModal
+            key={modalItem.id}
+            item={modalItem}
+            allCatalog={allSearchableCatalog}
+            isInMyList={myListIds.includes(modalItem.id)}
+            tmdbApiKey={settings.tmdbApiKey}
+            youtubeApiKey={settings.youtubeApiKey}
+            watchHistory={watchHistory}
+            continueEntry={continueWatching.find((c) => c.itemId === modalItem.id)}
+            onClose={() => setModalItem(null)}
+            onPlay={handleOpenPlayer}
+            onToggleMyList={handleToggleMyList}
+            onSelectSimilar={(sim) => setModalItem(sim)}
+            onItemEnriched={handleItemEnriched}
+          />
+        </Suspense>
+      )}
 
-      <VideoPlayer
-        item={playerState?.item ?? null}
-        season={playerState?.season}
-        episodeNumber={playerState?.episodeNumber}
-        episodeId={playerState?.episodeId}
-        episodeTitle={playerState?.episodeTitle}
-        episodeLabel={playerState?.episodeLabel}
-        initialProgressPercent={playerState?.initialProgressPercent}
-        initialTimeSeconds={playerState?.initialTimeSeconds}
-        streamUrl={playerState?.streamUrl}
-        sources={playerState?.sources}
-        preferredSourceId={playerState?.preferredSourceId}
-        preferredSourceLabel={playerState?.preferredSourceLabel}
-        preferredSourceUrl={playerState?.preferredSourceUrl}
-        streamProxyPrefix={settings.streamProxyPrefix}
-        autoProxyHttpStreams={settings.autoProxyHttpStreams ?? true}
-        onOpenAdminSettings={() => {
-          setAdminInitialTab('settings');
-          setActiveSection('admin');
-        }}
-        onProgressUpdate={(payload) => {
-          void persistPlaybackProgress(payload);
-        }}
-        onSelectEpisode={handleSelectNextEpisode}
-        onClose={handleClosePlayer}
-      />
+      {playerState && (
+        <Suspense fallback={<LoadingView>Carregando player…</LoadingView>}>
+          <VideoPlayer
+            item={playerState.item}
+            season={playerState.season}
+            episodeNumber={playerState.episodeNumber}
+            episodeId={playerState.episodeId}
+            episodeTitle={playerState.episodeTitle}
+            episodeLabel={playerState.episodeLabel}
+            initialProgressPercent={playerState.initialProgressPercent}
+            initialTimeSeconds={playerState.initialTimeSeconds}
+            streamUrl={playerState.streamUrl}
+            sources={playerState.sources}
+            preferredSourceId={playerState.preferredSourceId}
+            preferredSourceLabel={playerState.preferredSourceLabel}
+            preferredSourceUrl={playerState.preferredSourceUrl}
+            streamProxyPrefix={settings.streamProxyPrefix}
+            autoProxyHttpStreams={settings.autoProxyHttpStreams ?? true}
+            onOpenAdminSettings={() => {
+              setAdminInitialTab('settings');
+              setActiveSection('admin');
+            }}
+            onProgressUpdate={(payload) => {
+              void persistPlaybackProgress(payload);
+            }}
+            onSelectEpisode={handleSelectNextEpisode}
+            onClose={handleClosePlayer}
+          />
+        </Suspense>
+      )}
     </div>
   );
 }

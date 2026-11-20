@@ -265,6 +265,8 @@ test('PostgreSQL keeps distinct works without TMDB ID separated by exact year an
         qualityTag: 'HD',
         resolutionTag: 'HD',
         url: `https://${TEST_RUN_TAG}-cdn2.example.com/dune2021-720p.mp4`,
+        headers: { referer: 'https://provider.example/', userAgent: 'Test Player' },
+        clearKey: { keyId: '12'.repeat(16), key: '34'.repeat(16) },
         listId,
         status: 'pending',
       },
@@ -285,6 +287,9 @@ test('PostgreSQL keeps distinct works without TMDB ID separated by exact year an
   assert.equal(duna2021.sources.length, 2);
   assert.equal(duna2021.title, 'Duna'); // TMDB title NOT overwritten by un-enriched import!
   assert.equal(duna2021.sources[0].resolutionTag, '4K'); // Priority preserved
+  const addedSource = duna2021.sources.find((source) => source.resolutionTag === 'HD');
+  assert.deepEqual(addedSource?.headers, duplicateAlias.sources?.[0].headers);
+  assert.deepEqual(addedSource?.clearKey, duplicateAlias.sources?.[0].clearKey);
 });
 
 test('Deleting and re-importing a list preserves work IDs, TMDB/YouTube sheets, series episodes, per-user favorites, and watch progress', async () => {

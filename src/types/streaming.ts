@@ -40,6 +40,11 @@ export interface AuthorizedStreamHeaders {
   origin?: string;
 }
 
+export interface ClearKeyConfig {
+  keyId: string;
+  key: string;
+}
+
 export interface MediaSource {
   id: string;
   label: string;
@@ -51,6 +56,7 @@ export interface MediaSource {
   resolvedUrl?: string;
   detectedFormat?: string;
   headers?: AuthorizedStreamHeaders;
+  clearKey?: ClearKeyConfig;
   listId?: string;
   groupTitle?: string;
   tvgId?: string;

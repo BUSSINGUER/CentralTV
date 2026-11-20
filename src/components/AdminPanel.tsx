@@ -611,6 +611,9 @@ export function AdminPanel({
   };
 
   const formatMergeSummary = (result: M3UImportStats) => {
+    if (result.awaitingUpload) {
+      return `${result.rawEntries.toLocaleString('pt-BR')} entradas salvas neste navegador. Abra Listas e escolha “Retomar envio” para sincronizar em lotes.`;
+    }
     if (result.syncError) {
       return `Arquivo lido, envio incompleto: ${result.syncError} Use “Retomar envio” em Listas.`;
     }
@@ -642,7 +645,7 @@ export function AdminPanel({
       if (stayOnLists) setListActionMsg(summary);
       setListCustomName('');
       await refreshImportedCatalog(result.syncError);
-      if (!stayOnLists) setActiveTab('queue');
+      if (!stayOnLists) setActiveTab(result.awaitingUpload ? 'lists' : 'queue');
     } catch (err) {
       if ((err as Error)?.name !== 'AbortError') {
         setImportError(
@@ -681,7 +684,7 @@ export function AdminPanel({
       setM3uUrl('');
       setListCustomName('');
       await refreshImportedCatalog(result.syncError);
-      if (!stayOnLists) setActiveTab('queue');
+      if (!stayOnLists) setActiveTab(result.awaitingUpload ? 'lists' : 'queue');
     } catch (err) {
       if ((err as Error)?.name !== 'AbortError') {
         setImportError(
@@ -735,7 +738,7 @@ export function AdminPanel({
       setXtreamPassword('');
       setListCustomName('');
       await refreshImportedCatalog(result.syncError);
-      if (!stayOnLists) setActiveTab('queue');
+      if (!stayOnLists) setActiveTab(result.awaitingUpload ? 'lists' : 'queue');
     } catch (err) {
       if ((err as Error)?.name !== 'AbortError') {
         setImportError(
@@ -1312,18 +1315,17 @@ export function AdminPanel({
           >
             <FileUp className="mb-3 h-9 w-9 text-white/55" />
             <h3 className="font-display text-base font-bold text-white">
-              Upload Direto de Arquivo .M3U / .M3U8 (Streaming por Chunks)
+              Importar lista ou catálogo de canais
             </h3>
             <p className="mt-1 max-w-lg text-xs leading-relaxed text-white/60">
-              Suporta listas grandes (200 MB+) sem travar o navegador, com
-              agrupamento automático de fontes (4K prioritário) e mesclagem
-              inteligente no IndexedDB.
+              Aceita arquivos M3U, M3U8 e o catálogo TXT de canais do Saimo.
+              A leitura é feita por partes e agrupa as fontes do mesmo título.
             </p>
 
             <input
               ref={fileInputRef}
               type="file"
-              accept=".m3u,.m3u8,text/plain"
+              accept=".m3u,.m3u8,.txt,text/plain"
               className="hidden"
               onChange={(e) => {
                 const file = e.target.files?.[0];
@@ -1342,7 +1344,7 @@ export function AdminPanel({
                 className="inline-flex h-10 items-center gap-2 rounded-lg bg-white px-5 text-xs font-bold text-[#0B0C0E] hover:bg-white/90 disabled:opacity-50"
               >
                 <Upload className="h-4 w-4" />
-                Selecionar Arquivo .M3U / .M3U8
+                Selecionar arquivo M3U ou catálogo TXT
               </button>
 
               <button
@@ -1365,15 +1367,12 @@ export function AdminPanel({
           >
             <div className="flex items-center gap-2 text-sm font-bold text-white">
               <Link2 className="h-4 w-4 text-[#E50914]" />
-              URL Direta (Lista M3U ou Catálogo JSON)
+              URL da lista ou catálogo
             </div>
             <p className="text-xs leading-relaxed text-white/60">
-              Requisitada via backend (<code>/api/fetch-list</code>) para evitar
-              bloqueios de CORS. Detecta automaticamente{' '}
-              <code>#EXTM3U / #EXTINF</code>, catálogos <code>JSON</code>{' '}
-              (mapeando <code>title/name</code>, <code>url/stream_url</code>,{' '}
-              <code>poster/logo/cover</code>, <code>category/group</code> e{' '}
-              <code>type</code>) e alerta se o link for uma página HTML.
+              Aceita M3U, JSON e o catálogo TXT de canais do Saimo. Listas HTTPS
+              são baixadas direto quando o provedor permite. Listas com mais
+              de mil entradas aguardam envio na aba Listas.
             </p>
             <div className="flex flex-col gap-3 sm:flex-row">
               <input
